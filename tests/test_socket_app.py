@@ -1,9 +1,11 @@
 import importlib
+import json
 import subprocess
 import sys
 import threading
 import types
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from print_job_client import PrintJob
@@ -91,7 +93,10 @@ class ClaimedJobPrinterTests(unittest.TestCase):
         ):
             result = module.print_claimed_job(
                 JOB,
-                {"SUMATRA_PDF_PATH": "C:/Program Files/SumatraPDF/SumatraPDF.exe"},
+                {
+                    "SUMATRA_PDF_PATH": "C:/Program Files/SumatraPDF/SumatraPDF.exe",
+                    "SPOOL_TIMEOUT_SECONDS": 45,
+                },
             )
 
         self.assertEqual(result, module.PrintResult(success=True, error=None))
@@ -102,6 +107,7 @@ class ClaimedJobPrinterTests(unittest.TestCase):
                     "C:/Temp/job.pdf",
                     "Kitchen Printer 1",
                     "C:/Program Files/SumatraPDF/SumatraPDF.exe",
+                    45,
                 )
             ],
         )
@@ -133,6 +139,99 @@ class ClaimedJobPrinterTests(unittest.TestCase):
         self.assertIn("CalledProcessError", result.error)
         self.assertLessEqual(len(result.error), module.MAX_PRINTER_ERROR_LENGTH)
 
+    def test_print_pdf_silent_uses_argument_list_check_and_default_timeout(self):
+        module = load_printer_handlers()
+        with patch.object(module.subprocess, "run") as run:
+            result = module.print_pdf_silent(
+                "C:/Temp/job.pdf",
+                "Kitchen Printer 1",
+                "C:/Program Files/SumatraPDF/SumatraPDF.exe",
+            )
+
+        self.assertTrue(result.success)
+        run.assert_called_once_with(
+            [
+                "C:/Program Files/SumatraPDF/SumatraPDF.exe",
+                "-print-to",
+                "Kitchen Printer 1",
+                "-print-settings",
+                "noscale",
+                "C:/Temp/job.pdf",
+            ],
+            check=True,
+            timeout=120,
+        )
+
+    def test_print_pdf_timeout_returns_structured_duplicate_uncertainty(self):
+        module = load_printer_handlers()
+        timeout = subprocess.TimeoutExpired(["SumatraPDF.exe"], 120)
+        with patch.object(module.subprocess, "run", side_effect=timeout):
+            result = module.print_pdf_silent(
+                "C:/Temp/job.pdf",
+                "Kitchen Printer 1",
+                "C:/Program Files/SumatraPDF/SumatraPDF.exe",
+            )
+
+        self.assertFalse(result.success)
+        self.assertIn("outcome is unknown", result.error)
+        self.assertIn("retry may duplicate", result.error)
+        self.assertLessEqual(len(result.error), module.MAX_PRINTER_ERROR_LENGTH)
+
+    def test_print_claimed_job_rejects_timeout_outside_safe_bounds(self):
+        module = load_printer_handlers()
+        with (
+            patch.object(module, "get_local_printers", return_value=["Kitchen Printer 1"]),
+            patch.object(module, "save_pdf_from_base64", return_value="C:/Temp/job.pdf"),
+            patch.object(module, "print_pdf_silent") as spool,
+            patch.object(module.os, "remove"),
+        ):
+            result = module.print_claimed_job(JOB, {"SPOOL_TIMEOUT_SECONDS": 0})
+
+        self.assertFalse(result.success)
+        self.assertIn("SPOOL_TIMEOUT_SECONDS", result.error)
+        spool.assert_not_called()
+
+    def test_print_claimed_job_cleans_up_after_spool_failure(self):
+        module = load_printer_handlers()
+        with (
+            patch.object(module, "get_local_printers", return_value=["Kitchen Printer 1"]),
+            patch.object(module, "save_pdf_from_base64", return_value="C:/Temp/job.pdf"),
+            patch.object(
+                module,
+                "print_pdf_silent",
+                return_value=module.PrintResult(False, "Paper jam"),
+            ),
+            patch.object(module.os, "remove") as remove,
+        ):
+            result = module.print_claimed_job(JOB, {})
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.error, "Paper jam")
+        remove.assert_called_once_with("C:/Temp/job.pdf")
+
+    def test_partial_temp_file_is_removed_when_write_fails(self):
+        module = load_printer_handlers()
+
+        class FailingFile:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, traceback):
+                return False
+
+            def write(self, data):
+                raise OSError("disk full")
+
+        with (
+            patch.object(module.tempfile, "mkstemp", return_value=(42, "C:/Temp/partial.pdf")),
+            patch.object(module.os, "fdopen", return_value=FailingFile()),
+            patch.object(module.os, "remove") as remove,
+        ):
+            result = module.save_pdf_from_base64(JOB.payload)
+
+        self.assertIsNone(result)
+        remove.assert_called_once_with("C:/Temp/partial.pdf")
+
 
 class FakePrintJobClient:
     def __init__(self, *claim_batches):
@@ -152,6 +251,8 @@ class DurableDrainTests(unittest.TestCase):
     def setUp(self):
         self.module = load_socket_app()
         self.module._drain_lock = threading.Lock()
+        self.module._drain_running = False
+        self.module._drain_requested = False
 
     def test_success_is_acknowledged_only_after_spool_returns(self):
         client = FakePrintJobClient([JOB], [])
@@ -210,14 +311,24 @@ class DurableDrainTests(unittest.TestCase):
         entered_claim = threading.Event()
         release_claim = threading.Event()
         claim_count = 0
+        concurrent_claims = 0
+        maximum_concurrent_claims = 0
 
         class BlockingClient:
             def claim(self, limit=10):
-                nonlocal claim_count
+                nonlocal claim_count, concurrent_claims, maximum_concurrent_claims
                 claim_count += 1
-                entered_claim.set()
-                release_claim.wait(timeout=2)
-                return []
+                concurrent_claims += 1
+                maximum_concurrent_claims = max(
+                    maximum_concurrent_claims,
+                    concurrent_claims,
+                )
+                try:
+                    entered_claim.set()
+                    release_claim.wait(timeout=2)
+                    return []
+                finally:
+                    concurrent_claims -= 1
 
         self.module.print_job_client = BlockingClient()
         first = threading.Thread(target=self.module.drain_pending_jobs)
@@ -231,7 +342,44 @@ class DurableDrainTests(unittest.TestCase):
 
         self.assertFalse(first.is_alive())
         self.assertFalse(second.is_alive())
-        self.assertEqual(claim_count, 1)
+        self.assertEqual(claim_count, 2)
+        self.assertEqual(maximum_concurrent_claims, 1)
+
+    def test_wake_at_final_empty_claim_runs_a_coalesced_follower_drain(self):
+        claim_count = 0
+        concurrent_claims = 0
+        maximum_concurrent_claims = 0
+
+        class WakeOnEmpty(list):
+            def __bool__(inner_self):
+                follower = threading.Thread(target=self.module.drain_pending_jobs)
+                follower.start()
+                follower.join(timeout=2)
+                self.assertFalse(follower.is_alive())
+                return False
+
+        class BoundaryClient:
+            def claim(inner_self, limit=10):
+                nonlocal claim_count, concurrent_claims, maximum_concurrent_claims
+                claim_count += 1
+                concurrent_claims += 1
+                maximum_concurrent_claims = max(
+                    maximum_concurrent_claims,
+                    concurrent_claims,
+                )
+                try:
+                    if claim_count == 1:
+                        return WakeOnEmpty()
+                    return []
+                finally:
+                    concurrent_claims -= 1
+
+        self.module.print_job_client = BoundaryClient()
+
+        self.module.drain_pending_jobs()
+
+        self.assertEqual(claim_count, 2)
+        self.assertEqual(maximum_concurrent_claims, 1)
 
 
 class SocketWakeTests(unittest.TestCase):
@@ -266,6 +414,85 @@ class SocketWakeTests(unittest.TestCase):
 
         send_printers.assert_called_once_with(["Kitchen Printer 1"], self.module.config_data)
         self.assertEqual(drain.call_count, 2)
+
+    def test_enumeration_failure_isolated_and_registration_retries_on_reconnect(self):
+        self.module.config_data = {"FRAPPE_BASE_URL": "https://ourcity.s.frappe.cloud"}
+        errors = []
+        with (
+            patch.object(
+                self.module,
+                "get_local_printers",
+                side_effect=[OSError("Windows spooler unavailable"), ["Kitchen Printer 1"]],
+            ),
+            patch.object(self.module, "send_printers_to_server", return_value=True) as send,
+            patch.object(self.module, "drain_pending_jobs") as drain,
+        ):
+            for _ in range(2):
+                try:
+                    self.module.on_connect()
+                except Exception as exc:
+                    errors.append(exc)
+
+        self.assertEqual(errors, [])
+        send.assert_called_once_with(["Kitchen Printer 1"], self.module.config_data)
+        self.assertEqual(drain.call_count, 2)
+        self.assertTrue(self.module._registered_once)
+
+    def test_failed_registration_retries_without_blocking_connect_drains(self):
+        self.module.config_data = {"FRAPPE_BASE_URL": "https://ourcity.s.frappe.cloud"}
+        with (
+            patch.object(self.module, "get_local_printers", return_value=["Kitchen Printer 1"]),
+            patch.object(
+                self.module,
+                "send_printers_to_server",
+                side_effect=[False, True],
+            ) as send,
+            patch.object(self.module, "drain_pending_jobs") as drain,
+        ):
+            self.module.on_connect()
+            self.module.on_connect()
+
+        self.assertEqual(send.call_count, 2)
+        self.assertEqual(drain.call_count, 2)
+        self.assertTrue(self.module._registered_once)
+
+    def test_cookie_session_registration_does_not_require_api_token_keys(self):
+        class RegistrationResponse:
+            ok = True
+
+        class CookieSession:
+            def __init__(self):
+                self.calls = []
+
+            def post(self, url, *, json, timeout):
+                self.calls.append((url, json, timeout))
+                return RegistrationResponse()
+
+        session = CookieSession()
+        self.module.http_session = session
+        errors = []
+        try:
+            result = self.module.send_printers_to_server(
+                ["Kitchen Printer 1"],
+                {"FRAPPE_BASE_URL": "https://ourcity.s.frappe.cloud"},
+            )
+        except Exception as exc:
+            errors.append(exc)
+            result = None
+
+        self.assertEqual(errors, [])
+        self.assertTrue(result)
+        self.assertEqual(
+            session.calls,
+            [
+                (
+                    "https://ourcity.s.frappe.cloud/api/method/"
+                    "local_printers.utils.save_printers_data",
+                    {"printers": ["Kitchen Printer 1"]},
+                    30,
+                )
+            ],
+        )
 
 
 class AuthenticatedSessionTests(unittest.TestCase):
@@ -324,6 +551,27 @@ class AuthenticatedSessionTests(unittest.TestCase):
             ],
         )
         self.assertEqual(session.headers["Authorization"], "token dummy-key:dummy-secret")
+
+
+class ConfigurationSampleTests(unittest.TestCase):
+    def test_sample_config_is_credential_free_and_accepted_by_runtime_validators(self):
+        module = load_socket_app()
+        printer_handlers = load_printer_handlers()
+        sample_path = Path(__file__).resolve().parents[1] / "config copy.json"
+        config = json.loads(sample_path.read_text(encoding="utf-8"))
+
+        client = importlib.import_module("print_job_client").PrintJobClient(
+            session=Mock(post=Mock()),
+            base_url=module.build_http_base_url(config),
+            worker_id=config["WORKER_ID"],
+        )
+
+        self.assertEqual(client.base_url, "https://ourcity.s.frappe.cloud")
+        self.assertEqual(client.worker_id, "ourcity-windows-printer-01")
+        self.assertEqual(printer_handlers.get_spool_timeout(config), 120)
+        self.assertEqual(config["API_KEY"], "")
+        self.assertEqual(config["API_SECRET"], "")
+        self.assertEqual(config["AUTH_DATA"]["pwd"], "replace-with-worker-password")
 
 
 if __name__ == "__main__":

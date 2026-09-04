@@ -1,106 +1,120 @@
-
 # Local Printers Windows App
 
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+Windows middleware for durable ERPNext printing. ERPNext persists and renders each
+`Local Print Job`; Socket.IO only wakes this app. The app then claims jobs over the
+authenticated REST API, prints each PDF to its exact Windows printer name, and
+acknowledges success or failure.
 
-A lightweight Windows middleware that receives **pre-rendered print-ready HTML** from Frappe/ERPNext via Socket.IO, converts it to PDF, and silently prints to the designated local printers.
-
-## How It Works
-
-```
-ERPNext (Sales Invoice Submit)
-  └─► Frappe app renders HTML using chosen Print Format (server-side)
-        └─► Socket.IO event → sends { html, printer, invoice_name, … }
-              └─► This Windows app receives the event
-                    └─► wkhtmltopdf converts HTML → PDF
-                          └─► SumatraPDF silently prints to local printer
-```
-
-All HTML rendering and template logic lives in the **Frappe app** (`local_printers`).
-The Windows app is a thin print client — it only converts HTML to PDF and prints.
-
-## Prerequisites
+## Requirements
 
 - Python 3.10+
-- Windows OS (uses `win32print`)
-- [SumatraPDF](https://www.sumatrapdfreader.org) (silent PDF printing)
-- [wkhtmltopdf](https://wkhtmltopdf.org) (HTML → PDF conversion)
-- Frappe/ERPNext with the `local_printers` app installed
+- Windows with the target printers installed
+- [SumatraPDF](https://www.sumatrapdfreader.org)
+- ERPNext/Frappe with the `local_printers` durable print-job APIs deployed
+- An ERPNext service user with the `Local Printer Worker` role
 
-## Installation
+## Install
 
-```bash
-git clone https://github.com/Ahmed-Mansy-Mansico/local_printers_winapp.git
+```powershell
+git clone https://github.com/HtayOoLwin/local_printers_winapp.git
 cd local_printers_winapp
-pip install -r requirements.txt
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+Copy-Item "config copy.json" config.json
 ```
 
-## Configuration
+## Configure Our City
 
-Copy `config copy.json` to `config.json` and fill in your values:
+Edit the untracked `config.json`. Do not put real passwords, API secrets, cookies,
+or authorization headers in `config copy.json`, source control, or support logs.
 
 ```json
 {
-  "FRAPPE_SOCKET_URL": "https://your-site.com",
-  "LOGIN_URL": "https://your-site.com/api/method/login",
+  "FRAPPE_BASE_URL": "https://ourcity.s.frappe.cloud",
+  "FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud",
+  "LOGIN_URL": "https://ourcity.s.frappe.cloud/api/method/login",
   "AUTH_DATA": {
-    "usr": "your-username",
-    "pwd": "your-password"
+    "usr": "your-local-printer-worker-user",
+    "pwd": "your-local-printer-worker-password"
   },
-  "API_KEY": "your-api-key",
-  "API_SECRET": "your-api-secret",
-  "WKHTMLTOPDF": "C:\\Program Files\\wkhtmltopdf\\bin\\wkhtmltopdf.exe",
+  "API_KEY": "",
+  "API_SECRET": "",
+  "WORKER_ID": "ourcity-windows-printer-01",
+  "SPOOL_TIMEOUT_SECONDS": 120,
   "SUMATRA_PDF_PATH": "C:\\Program Files\\SumatraPDF\\SumatraPDF.exe"
 }
 ```
 
-| Key | Description |
-|-----|-------------|
-| `FRAPPE_SOCKET_URL` | Your ERPNext site URL |
-| `LOGIN_URL` | Login endpoint (usually `{site}/api/method/login`) |
-| `AUTH_DATA` | Credentials for Socket.IO session |
-| `API_KEY` / `API_SECRET` | API token for printer registration |
-| `WKHTMLTOPDF` | Path to `wkhtmltopdf.exe` |
-| `SUMATRA_PDF_PATH` | Path to `SumatraPDF.exe` |
+Configuration rules:
 
-## Usage
+- `FRAPPE_BASE_URL` is the HTTPS origin used for durable claim and acknowledgement
+  requests. For Our City it must be `https://ourcity.s.frappe.cloud`.
+- `FRAPPE_SOCKET_URL` is the Socket.IO origin. It is a wake channel only; no event
+  body is printed.
+- `LOGIN_URL` and `AUTH_DATA` establish the session cookie used by both REST and
+  Socket.IO.
+- `WORKER_ID` is required. Give every Windows print-service installation a unique,
+  stable identifier and keep it unchanged across restarts. Do not reuse one worker
+  ID on multiple PCs.
+- `API_KEY` and `API_SECRET` are optional when the logged-in session may register
+  printers. If token authentication is used, configure both values together.
+- `SUMATRA_PDF_PATH` must point to the installed SumatraPDF executable.
+- `SPOOL_TIMEOUT_SECONDS` is the maximum SumatraPDF call duration. It must be an
+  integer from 5 through 600; the default and sample value is 120 seconds.
 
-```bash
-python socket_app.py
+The Printer value configured in ERPNext must exactly match the Windows printer name,
+including case and spacing.
+
+## Run
+
+```powershell
+.\.venv\Scripts\python.exe socket_app.py
 ```
 
-The app will:
-1. Load config and log in to your Frappe site
-2. Connect via Socket.IO and register local printers
-3. Listen for `sales_invoice_submitted` events
-4. Convert received HTML to PDF and print silently
+On every connection or reconnection the middleware drains persisted work missed
+while offline. Duplicate Socket.IO wakes are coalesced into serialized follower
+passes, so no two drain loops print concurrently and a wake at drain shutdown is not
+lost.
 
-## Print Format Setup (Server Side)
+For each claimed job the app:
 
-In ERPNext, go to **Printer Item Group** and configure:
-- **POS Profile** — which POS triggers this printer
-- **Printer** — the local printer name (auto-discovered)
-- **Print Format** — choose which Print Format to render (Link field)
-- **No Letterhead** — skip letterhead if needed
-- **Item Groups** — route specific item categories to this printer
+1. validates the job ID, exact printer, base64 PDF payload, ticket type, and attempt;
+2. writes a temporary PDF;
+3. waits for SumatraPDF to return after submitting to the selected printer;
+4. acknowledges success only after that call succeeds, otherwise acknowledges a
+   bounded failure; and
+5. removes the temporary file.
 
-The Frappe app renders the full HTML using `frappe.get_print()` with your chosen
-Print Format and sends it to this Windows app ready to print.
+## Timeout and duplicate-print uncertainty
+
+A SumatraPDF timeout is acknowledged as a failed attempt, but Windows may have
+accepted the document before the process timed out. The spool outcome is therefore
+unknown and the server's automatic retry can produce a duplicate ticket. After a
+timeout, inspect the Windows print queue and physical output before manually
+retrying. Choose a timeout long enough for the slowest expected printer while staying
+within the 5–600 second bound.
+
+## Verification
+
+Run the middleware tests before deployment:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m compileall -q print_job_client.py socket_app.py printer_handlers.py tests
+```
+
+Then create one test job and verify the ERPNext transition
+`Pending -> Printing -> Success` and one physical print on the exact configured
+Windows printer.
 
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| Connection failures | Check `config.json` URL and credentials |
-| No printers detected | Verify printers are installed locally |
-| PDF generation fails | Check wkhtmltopdf path and installation |
-| Silent print fails | Check SumatraPDF path and printer name |
-
-## Related Projects
-
-- [local_printers](https://github.com/Ahmed-Mansy-Mansico/local_printers) — Frappe app for ERPNext integration
-
-## License
-
-MIT License
+| Symptom | Check |
+|---|---|
+| Cannot connect | Our City URLs, worker credentials, network, and system clock |
+| Worker ID rejected | `WORKER_ID` format, uniqueness, stability, and service-user ownership |
+| Printer registration retries | Windows spooler availability and exact installed names |
+| Job remains `Printing` | REST connectivity and acknowledgement logs |
+| Print fails immediately | `SUMATRA_PDF_PATH`, exact printer name, and PDF permissions |
+| SumatraPDF timeout | Windows queue/output first; a retry may duplicate the ticket |

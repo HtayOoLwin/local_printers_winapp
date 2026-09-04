@@ -60,6 +60,8 @@ print_job_client: PrintJobClient | None = None
 _register_lock = Lock()
 _registered_once = False
 _drain_lock = Lock()
+_drain_running = False
+_drain_requested = False
 
 
 # ---------------------------------------------------------------------------
@@ -108,40 +110,54 @@ def build_http_base_url(cfg: dict[str, Any]) -> str:
     raise ValueError("Cannot determine HTTP base URL. Set FRAPPE_BASE_URL in config.json.")
 
 
-def send_printers_to_server(printers: list[str], cfg: dict[str, Any]) -> None:
+def send_printers_to_server(printers: list[str], cfg: dict[str, Any]) -> bool:
     """Register local printer names on the Frappe server."""
     print(f"[SERVER] Sending {len(printers)} printer(s) to server ...")
-    headers = {
-        "Authorization": f"token {cfg['API_KEY']}:{cfg['API_SECRET']}",
-        "Content-Type": "application/json",
-    }
     try:
         base_url = build_http_base_url(cfg)
-        session = http_session or requests
+        session = http_session
+        request_options: dict[str, Any] = {
+            "json": {"printers": printers},
+            "timeout": 30,
+        }
+        if session is None:
+            api_key = cfg.get("API_KEY")
+            api_secret = cfg.get("API_SECRET")
+            if not api_key or not api_secret:
+                raise ValueError(
+                    "API_KEY and API_SECRET are required without an authenticated session"
+                )
+            session = requests
+            request_options["headers"] = {
+                "Authorization": f"token {api_key}:{api_secret}",
+                "Content-Type": "application/json",
+            }
+
         resp = session.post(
             f"{base_url}/api/method/local_printers.utils.save_printers_data",
-            json={"printers": printers},
-            **({} if http_session else {"headers": headers}),
-            timeout=30,
+            **request_options,
         )
         if resp.ok:
             print("[SERVER] Printers registered on server.")
             log.info("Printers data sent to server.")
+            return True
         else:
-            print(f"[SERVER] Server responded {resp.status_code}: {resp.text}")
-            log.warning("Failed to send printers (%s): %s", resp.status_code, resp.text)
+            print(f"[SERVER] Printer registration returned HTTP {resp.status_code}.")
+            log.warning("Printer registration returned HTTP %s.", resp.status_code)
     except requests.RequestException as exc:
         print(f"[SERVER] Error sending printers: {exc}")
         log.error("Error sending printers to server: %s", exc)
     except Exception as exc:
-        print(f"[SERVER] Configuration error: {exc}")
-        log.error("Configuration error while sending printers: %s", exc)
+        error = bounded_printer_error(exc)
+        print(f"[SERVER] Printer registration error: {error}")
+        log.error("Printer registration error: %s", error)
+    return False
 
 
 def authenticate_http_session(cfg: dict[str, Any]) -> tuple[Any, str] | None:
     """Log in once and return the reusable HTTP session and Socket.IO cookie."""
-    print(f"[AUTH] Logging in to {cfg['LOGIN_URL']} ...")
     try:
+        print(f"[AUTH] Logging in to {cfg['LOGIN_URL']} ...")
         session = requests.Session()
         api_key = cfg.get("API_KEY")
         api_secret = cfg.get("API_SECRET")
@@ -172,96 +188,126 @@ def authenticate_http_session(cfg: dict[str, Any]) -> tuple[Any, str] | None:
 
 
 def drain_pending_jobs() -> None:
-    """Claim, print, and acknowledge durable jobs with single-drain serialization."""
-    if not _drain_lock.acquire(blocking=False):
-        log.debug("A print-job drain is already running; duplicate wake ignored.")
-        return
+    """Coalesce wake requests while running claim passes one at a time."""
+    global _drain_requested, _drain_running
 
-    try:
-        client = print_job_client
-        if client is None:
-            log.warning("Print-job drain requested before the REST client was configured.")
+    with _drain_lock:
+        _drain_requested = True
+        if _drain_running:
+            log.debug("A print-job drain is running; wake coalesced for a follower pass.")
+            return
+        _drain_running = True
+
+    while True:
+        with _drain_lock:
+            _drain_requested = False
+
+        try:
+            _drain_claim_loop()
+        except Exception as exc:
+            error = bounded_printer_error(exc)
+            log.error("Unexpected print-job drain failure: %s", error)
+
+        with _drain_lock:
+            if _drain_requested:
+                continue
+            _drain_running = False
             return
 
-        while True:
+
+def _drain_claim_loop() -> None:
+    """Claim until empty, printing and acknowledging each batch sequentially."""
+    client = print_job_client
+    if client is None:
+        log.warning("Print-job drain requested before the REST client was configured.")
+        return
+
+    while True:
+        try:
+            jobs = client.claim(limit=10)
+        except Exception as exc:
+            error = bounded_printer_error(exc)
+            log.error("Unable to claim print jobs: %s", error)
+            return
+
+        if not jobs:
+            return
+
+        for job in jobs:
             try:
-                jobs = client.claim(limit=10)
+                result = print_claimed_job(job, config_data)
+            except Exception as exc:
+                result_error = bounded_printer_error(exc)
+                success = False
+            else:
+                success = result.success
+                result_error = result.error
+
+            if not success and not result_error:
+                result_error = "Printer execution failed without error detail"
+            if result_error:
+                result_error = bounded_printer_error(result_error)
+
+            try:
+                client.acknowledge(
+                    job.job_id,
+                    success=success,
+                    error=None if success else result_error,
+                )
             except Exception as exc:
                 error = bounded_printer_error(exc)
-                log.error("Unable to claim print jobs: %s", error)
-                return
+                log.error("Could not acknowledge print job %s: %s", job.job_id, error)
+                continue
 
-            if not jobs:
-                return
-
-            for job in jobs:
-                try:
-                    result = print_claimed_job(job, config_data)
-                except Exception as exc:
-                    result_error = bounded_printer_error(exc)
-                    success = False
-                else:
-                    success = result.success
-                    result_error = result.error
-
-                if not success and not result_error:
-                    result_error = "Printer execution failed without error detail"
-                if result_error:
-                    result_error = bounded_printer_error(result_error)
-
-                try:
-                    client.acknowledge(
-                        job.job_id,
-                        success=success,
-                        error=None if success else result_error,
-                    )
-                except Exception as exc:
-                    error = bounded_printer_error(exc)
-                    log.error("Could not acknowledge print job %s: %s", job.job_id, error)
-                    continue
-
-                if success:
-                    log.info(
-                        "Print job %s succeeded on printer '%s'.",
-                        job.job_id,
-                        job.printer,
-                    )
-                else:
-                    log.warning(
-                        "Print job %s failed on printer '%s': %s",
-                        job.job_id,
-                        job.printer,
-                        result_error,
-                    )
-    finally:
-        _drain_lock.release()
+            if success:
+                log.info(
+                    "Print job %s succeeded on printer '%s'.",
+                    job.job_id,
+                    job.printer,
+                )
+            else:
+                log.warning(
+                    "Print job %s failed on printer '%s': %s",
+                    job.job_id,
+                    job.printer,
+                    result_error,
+                )
 
 
 # ---------------------------------------------------------------------------
 # Socket.IO event handlers
 # ---------------------------------------------------------------------------
 def on_connect() -> None:
-    global _registered_once
-
     print("[SOCKET] Connected to server.")
     log.info("Connected to server.")
 
-    should_register = False
-    # Avoid duplicate registration when subscribed to multiple namespaces while
-    # still draining on every connect/reconnect.
+    try:
+        register_local_printers_once()
+    finally:
+        drain_pending_jobs()
+
+
+def register_local_printers_once() -> None:
+    """Register once after success; leave failures retryable on reconnect."""
+    global _registered_once
+
     with _register_lock:
-        if not _registered_once:
-            _registered_once = True
-            should_register = True
+        if _registered_once:
+            return
+        try:
+            printers = get_local_printers()
+            print(f"[SOCKET] Local printers detected: {printers}")
+            log.info("Local printers: %s", printers)
+            if not send_printers_to_server(printers, config_data):
+                log.warning("Printer registration will be retried on reconnect.")
+                return
+        except Exception as exc:
+            error = bounded_printer_error(exc)
+            log.error("Local printer registration failed: %s", error)
+            return
 
-    if should_register:
-        printers = get_local_printers()
-        print(f"[SOCKET] Local printers detected: {printers}")
-        log.info("Local printers: %s", printers)
-        send_printers_to_server(printers, config_data)
+        _registered_once = True
         print("[SOCKET] Listening for durable print-job wake events")
-
-    drain_pending_jobs()
 
 
 def on_connect_error(data: Any) -> None:

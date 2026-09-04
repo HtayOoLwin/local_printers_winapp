@@ -17,6 +17,9 @@ from print_job_client import PrintJob
 
 
 MAX_PRINTER_ERROR_LENGTH = 1000
+DEFAULT_SPOOL_TIMEOUT_SECONDS = 120
+MIN_SPOOL_TIMEOUT_SECONDS = 5
+MAX_SPOOL_TIMEOUT_SECONDS = 600
 
 
 @dataclass(frozen=True)
@@ -33,6 +36,21 @@ def bounded_printer_error(error: BaseException | str) -> str:
         detail = str(error)
     detail = " ".join(detail.replace("\0", "").splitlines()).strip()
     return (detail or "Unknown printer error")[:MAX_PRINTER_ERROR_LENGTH]
+
+
+def get_spool_timeout(config_data: dict) -> int:
+    """Return a finite SumatraPDF timeout from the validated configuration."""
+    timeout = config_data.get("SPOOL_TIMEOUT_SECONDS", DEFAULT_SPOOL_TIMEOUT_SECONDS)
+    if (
+        type(timeout) is not int
+        or not MIN_SPOOL_TIMEOUT_SECONDS <= timeout <= MAX_SPOOL_TIMEOUT_SECONDS
+    ):
+        raise ValueError(
+            "SPOOL_TIMEOUT_SECONDS must be an integer from "
+            f"{MIN_SPOOL_TIMEOUT_SECONDS} to {MAX_SPOOL_TIMEOUT_SECONDS}"
+        )
+    return timeout
+
 
 # ---------------------------------------------------------------------------
 # Logging – file + console
@@ -65,6 +83,7 @@ def print_pdf_silent(
     pdf_path: str,
     printer_name: str,
     sumatra_pdf_path: str,
+    timeout_seconds: int = DEFAULT_SPOOL_TIMEOUT_SECONDS,
 ) -> PrintResult:
     """Print a PDF file silently using SumatraPDF."""
     command = [
@@ -78,10 +97,18 @@ def print_pdf_silent(
     print(f"[PRINT] Sending PDF to printer '{printer_name}' ...")
     log.info("Sending temporary PDF to printer '%s' with SumatraPDF.", printer_name)
     try:
-        subprocess.run(command, check=True)
+        subprocess.run(command, check=True, timeout=timeout_seconds)
         print(f"[PRINT] ✅ Sent '{pdf_path}' to printer '{printer_name}' successfully.")
         log.info("Sent %s to printer '%s'.", pdf_path, printer_name)
         return PrintResult(True)
+    except subprocess.TimeoutExpired:
+        error = bounded_printer_error(
+            f"SumatraPDF timed out after {timeout_seconds} seconds; spool outcome is unknown "
+            "and retry may duplicate the print"
+        )
+        print(f"[PRINT] ❌ Printing timed out for printer '{printer_name}': {error}")
+        log.error("Printing timed out for '%s': %s", printer_name, error)
+        return PrintResult(False, error)
     except Exception as exc:
         error = bounded_printer_error(exc)
         print(f"[PRINT] ❌ Printing failed for printer '{printer_name}': {error}")
@@ -92,10 +119,15 @@ def print_pdf_silent(
 def save_pdf_from_base64(pdf_base64: str) -> str | None:
     """Decode a base64-encoded PDF and save to a temporary file. Returns the PDF path."""
     print(f"[PDF] Decoding base64 PDF ({len(pdf_base64)} chars) ...")
+    fd: int | None = None
+    pdf_path: str | None = None
+    file_handle = None
     try:
         pdf_bytes = base64.b64decode(pdf_base64)
         fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
-        with os.fdopen(fd, "wb") as f:
+        file_handle = os.fdopen(fd, "wb")
+        fd = None
+        with file_handle as f:
             f.write(pdf_bytes)
         print(f"[PDF] ✅ Saved PDF: {pdf_path}")
         log.info("Saved PDF from base64: %s", pdf_path)
@@ -103,6 +135,21 @@ def save_pdf_from_base64(pdf_base64: str) -> str | None:
     except Exception as exc:
         print(f"[PDF] ❌ Failed to decode/save PDF: {exc}")
         log.error("Failed to decode/save PDF: %s", exc)
+        if file_handle is not None:
+            try:
+                file_handle.close()
+            except (AttributeError, OSError):
+                pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if pdf_path is not None:
+            try:
+                os.remove(pdf_path)
+            except OSError as cleanup_error:
+                log.warning("Could not remove partial PDF %s: %s", pdf_path, cleanup_error)
         return None
 
 
@@ -115,6 +162,7 @@ def print_claimed_job(job: PrintJob, config_data: dict) -> PrintResult:
                 bounded_printer_error(f"Printer '{job.printer}' is not installed"),
             )
 
+        timeout_seconds = get_spool_timeout(config_data)
         pdf_path = save_pdf_from_base64(job.payload)
         if not pdf_path:
             return PrintResult(False, "Unable to decode the print-job PDF payload")
@@ -124,7 +172,12 @@ def print_claimed_job(job: PrintJob, config_data: dict) -> PrintResult:
             r"C:\Program Files\SumatraPDF\SumatraPDF.exe",
         )
         try:
-            return print_pdf_silent(pdf_path, job.printer, sumatra_pdf_path)
+            return print_pdf_silent(
+                pdf_path,
+                job.printer,
+                sumatra_pdf_path,
+                timeout_seconds,
+            )
         finally:
             try:
                 os.remove(pdf_path)
@@ -154,6 +207,11 @@ def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
     sumatra_pdf_path = config_data.get(
         "SUMATRA_PDF_PATH", r"C:\Program Files\SumatraPDF\SumatraPDF.exe"
     )
+    try:
+        timeout_seconds = get_spool_timeout(config_data)
+    except ValueError as exc:
+        log.error("Invalid spool timeout configuration: %s", exc)
+        return []
 
     printed_to: list[str] = []
 
@@ -198,7 +256,12 @@ def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
         pdf_path = save_pdf_from_base64(pdf_base64)
         if pdf_path:
             try:
-                result = print_pdf_silent(pdf_path, printer_name, sumatra_pdf_path)
+                result = print_pdf_silent(
+                    pdf_path,
+                    printer_name,
+                    sumatra_pdf_path,
+                    timeout_seconds,
+                )
                 if result.success:
                     printed_to.append(printer_name)
                 else:
