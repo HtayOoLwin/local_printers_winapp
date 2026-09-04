@@ -1,14 +1,9 @@
 """
 Local Printers Windows App - Socket.IO client.
 
-Connects to a Frappe/ERPNext site via Socket.IO, listens for
-'document_print_event' (primary) and 'sales_invoice_submitted'
-(backward-compat) events, and silently prints each job to the
-designated local printer.
-
-Event contracts (mirrors utils.py):
-  document_print_event  -> { doctype, document_name, method, jobs: [...] }
-  sales_invoice_submitted -> [ { printer, pdf_base64, ... }, ... ]
+Connects to a Frappe/ERPNext site via Socket.IO. Events only wake a
+guarded REST drain; printable content is always claimed from the durable
+Local Print Job API before it is sent to an exact Windows printer.
 """
 
 import json
@@ -25,7 +20,8 @@ import requests
 import socketio
 import win32print
 
-from printer_handlers import print_jobs
+from print_job_client import PrintJobClient
+from printer_handlers import bounded_printer_error, print_claimed_job
 
 # ---------------------------------------------------------------------------
 # Logging - file + console
@@ -59,8 +55,11 @@ if not log.handlers:
 sio = socketio.Client(reconnection=True, reconnection_delay=5)
 
 config_data: dict[str, Any] = {}
+http_session: Any | None = None
+print_job_client: PrintJobClient | None = None
 _register_lock = Lock()
 _registered_once = False
+_drain_lock = Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -118,10 +117,11 @@ def send_printers_to_server(printers: list[str], cfg: dict[str, Any]) -> None:
     }
     try:
         base_url = build_http_base_url(cfg)
-        resp = requests.post(
+        session = http_session or requests
+        resp = session.post(
             f"{base_url}/api/method/local_printers.utils.save_printers_data",
             json={"printers": printers},
-            headers=headers,
+            **({} if http_session else {"headers": headers}),
             timeout=30,
         )
         if resp.ok:
@@ -138,11 +138,19 @@ def send_printers_to_server(printers: list[str], cfg: dict[str, Any]) -> None:
         log.error("Configuration error while sending printers: %s", exc)
 
 
-def fetch_session_cookies(cfg: dict[str, Any]) -> str | None:
-    """Log in and return a cookie header string."""
+def authenticate_http_session(cfg: dict[str, Any]) -> tuple[Any, str] | None:
+    """Log in once and return the reusable HTTP session and Socket.IO cookie."""
     print(f"[AUTH] Logging in to {cfg['LOGIN_URL']} ...")
     try:
-        resp = requests.post(cfg["LOGIN_URL"], data=cfg["AUTH_DATA"], timeout=30)
+        session = requests.Session()
+        api_key = cfg.get("API_KEY")
+        api_secret = cfg.get("API_SECRET")
+        if bool(api_key) != bool(api_secret):
+            raise ValueError("API_KEY and API_SECRET must be configured together")
+        if api_key and api_secret:
+            session.headers["Authorization"] = f"token {api_key}:{api_secret}"
+
+        resp = session.post(cfg["LOGIN_URL"], data=cfg["AUTH_DATA"], timeout=30)
         resp.raise_for_status()
         cookie_header = "; ".join(f"{k}={v}" for k, v in resp.cookies.items())
         if not cookie_header:
@@ -151,51 +159,82 @@ def fetch_session_cookies(cfg: dict[str, Any]) -> str | None:
             return None
         print("[AUTH] Login successful.")
         log.info("Login successful.")
-        return cookie_header
+        return session, cookie_header
     except requests.RequestException as exc:
         print(f"[AUTH] Login failed: {exc}")
         log.error("Login failed: %s", exc)
         return None
+    except (KeyError, TypeError, ValueError) as exc:
+        error = bounded_printer_error(exc)
+        print(f"[AUTH] Configuration error: {error}")
+        log.error("Authentication configuration error: %s", error)
+        return None
 
 
+def drain_pending_jobs() -> None:
+    """Claim, print, and acknowledge durable jobs with single-drain serialization."""
+    if not _drain_lock.acquire(blocking=False):
+        log.debug("A print-job drain is already running; duplicate wake ignored.")
+        return
 
+    try:
+        client = print_job_client
+        if client is None:
+            log.warning("Print-job drain requested before the REST client was configured.")
+            return
 
+        while True:
+            try:
+                jobs = client.claim(limit=10)
+            except Exception as exc:
+                error = bounded_printer_error(exc)
+                log.error("Unable to claim print jobs: %s", error)
+                return
 
-def extract_jobs(payload: Any) -> tuple[list[dict[str, Any]], str]:
-    """
-    Normalise any payload shape coming from utils.py into
-    (list_of_job_dicts, invoice_name).
+            if not jobs:
+                return
 
-    Supported shapes:
-      1. document_print_event  -> { doctype, document_name, method, jobs: [...] }
-      2. sales_invoice_submitted -> [ { printer, pdf_base64, invoice_name, ... }, ... ]
-      3. Single job dict        -> { printer, pdf_base64, ... }
-    """
-    if not payload:
-        return [], "unknown"
+            for job in jobs:
+                try:
+                    result = print_claimed_job(job, config_data)
+                except Exception as exc:
+                    result_error = bounded_printer_error(exc)
+                    success = False
+                else:
+                    success = result.success
+                    result_error = result.error
 
-    if isinstance(payload, dict):
-        # Shape 1 – wrapped payload from document_print_event
-        jobs = payload.get("jobs")
-        if isinstance(jobs, list):
-            invoice = str(payload.get("document_name") or "unknown")
-            return jobs, invoice
-        # Shape 3 – bare single job dict
-        if "pdf_base64" in payload:
-            invoice = str(payload.get("invoice_name") or payload.get("document_name") or "unknown")
-            return [payload], invoice
-        return [], "unknown"
+                if not success and not result_error:
+                    result_error = "Printer execution failed without error detail"
+                if result_error:
+                    result_error = bounded_printer_error(result_error)
 
-    if isinstance(payload, list):
-        # Shape 2 – legacy list from sales_invoice_submitted
-        invoice = "unknown"
-        if payload and isinstance(payload[0], dict):
-            invoice = str(
-                payload[0].get("invoice_name") or payload[0].get("document_name") or "unknown"
-            )
-        return payload, invoice
+                try:
+                    client.acknowledge(
+                        job.job_id,
+                        success=success,
+                        error=None if success else result_error,
+                    )
+                except Exception as exc:
+                    error = bounded_printer_error(exc)
+                    log.error("Could not acknowledge print job %s: %s", job.job_id, error)
+                    continue
 
-    return [], "unknown"
+                if success:
+                    log.info(
+                        "Print job %s succeeded on printer '%s'.",
+                        job.job_id,
+                        job.printer,
+                    )
+                else:
+                    log.warning(
+                        "Print job %s failed on printer '%s': %s",
+                        job.job_id,
+                        job.printer,
+                        result_error,
+                    )
+    finally:
+        _drain_lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -207,17 +246,22 @@ def on_connect() -> None:
     print("[SOCKET] Connected to server.")
     log.info("Connected to server.")
 
-    # Avoid duplicate registration when subscribed to multiple namespaces.
+    should_register = False
+    # Avoid duplicate registration when subscribed to multiple namespaces while
+    # still draining on every connect/reconnect.
     with _register_lock:
-        if _registered_once:
-            return
-        _registered_once = True
+        if not _registered_once:
+            _registered_once = True
+            should_register = True
 
-    printers = get_local_printers()
-    print(f"[SOCKET] Local printers detected: {printers}")
-    log.info("Local printers: %s", printers)
-    send_printers_to_server(printers, config_data)
-    print("[SOCKET] Listening for: document_print_event, sales_invoice_submitted")
+    if should_register:
+        printers = get_local_printers()
+        print(f"[SOCKET] Local printers detected: {printers}")
+        log.info("Local printers: %s", printers)
+        send_printers_to_server(printers, config_data)
+        print("[SOCKET] Listening for durable print-job wake events")
+
+    drain_pending_jobs()
 
 
 def on_connect_error(data: Any) -> None:
@@ -230,46 +274,23 @@ def on_disconnect() -> None:
     log.warning("Disconnected from server.")
 
 
-def process_print_event(event_name: str, payload: Any) -> None:
-    """Common handler for both print events."""
-    print("\n" + ("*" * 60))
-    print(f"[EVENT] Received '{event_name}' event.")
-    print("*" * 60)
-    log.info("Received event: %s", event_name)
-
-    jobs, invoice = extract_jobs(payload)
-
-    if not jobs:
-        print("[EVENT] Empty or unrecognised payload – nothing to print.")
-        log.warning("No printable jobs found in '%s' payload: %s", event_name, payload)
-        return
-
-    print(f"[EVENT] Invoice    : {invoice}")
-    print(f"[EVENT] Total jobs : {len(jobs)}")
-    for j in jobs:
-        print(
-            "[EVENT]   -> printer='%s'  format='%s'  cashier=%s"
-            % (j.get("printer"), j.get("print_format"), j.get("is_cashier"))
-        )
-    log.info("Prepared %d print job(s) for invoice %s", len(jobs), invoice)
-
-    try:
-        # Pass the extracted jobs list (not raw payload) to the print handler.
-        printed = print_jobs(jobs, config_data)
-        print(f"[EVENT] Printing complete. Printers used: {printed if printed else 'NONE'}")
-    except Exception as exc:
-        print(f"[EVENT] Printing failed: {exc}")
-        log.exception("Printing failed for invoice %s: %s", invoice, exc)
+def wake_print_job_drain(event_name: str) -> None:
+    """Treat Socket.IO notification content as metadata and wake REST claiming."""
+    print(f"[EVENT] Received '{event_name}' wake event.")
+    log.info("Received print-job wake event: %s", event_name)
+    drain_pending_jobs()
 
 
 def handle_document_print_event(data: Any) -> None:
-    """Primary event – new server contract (utils.py document_print_event)."""
-    process_print_event("document_print_event", data)
+    """Wake the durable drain; never execute content from the event payload."""
+    del data
+    wake_print_job_drain("document_print_event")
 
 
 def handle_sales_invoice_submitted(data: Any) -> None:
-    """Backward-compat event – utils.py still fires this for Sales Invoices."""
-    process_print_event("sales_invoice_submitted", data)
+    """Backward-compatible wake event; its legacy payload is ignored."""
+    del data
+    wake_print_job_drain("sales_invoice_submitted")
 
 
 def register_handlers(namespace: str) -> None:
@@ -285,10 +306,25 @@ def register_handlers(namespace: str) -> None:
 # ---------------------------------------------------------------------------
 def run_socketio_client(cfg: dict[str, Any], namespace: str) -> None:
     """Connect to the Frappe realtime server and block until disconnected."""
-    cookie_header = fetch_session_cookies(cfg)
-    if not cookie_header:
+    global http_session, print_job_client
+
+    authenticated = authenticate_http_session(cfg)
+    if not authenticated:
         print("[SOCKET] Cannot connect – no session cookies.")
         log.error("Cannot connect without valid session cookies.")
+        return
+    http_session, cookie_header = authenticated
+
+    try:
+        print_job_client = PrintJobClient(
+            session=http_session,
+            base_url=build_http_base_url(cfg),
+            worker_id=cfg["WORKER_ID"],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        error = bounded_printer_error(exc)
+        print(f"[SOCKET] Print worker configuration error: {error}")
+        log.error("Print worker configuration error: %s", error)
         return
 
     socket_url = str(cfg["FRAPPE_SOCKET_URL"]).rstrip("/")
