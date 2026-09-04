@@ -50,8 +50,11 @@ Configuration rules:
 
 - `FRAPPE_BASE_URL` is the HTTPS origin used for durable claim and acknowledgement
   requests. For Our City it must be `https://ourcity.s.frappe.cloud`.
-- `FRAPPE_SOCKET_URL` is the Socket.IO origin. It is a wake channel only; no event
-  body is printed.
+- `FRAPPE_SOCKET_URL` is the HTTP(S) Socket.IO origin. It must contain a scheme and
+  hostname, with an optional valid port, but no credentials, path, query, or
+  fragment. The Socket.IO namespace defaults to `/` followed by this hostname
+  (`/ourcity.s.frappe.cloud` for the sample). An optional `SOCKETIO_NAMESPACE`
+  override must be `/` or one safe path segment beginning with `/`.
 - `LOGIN_URL` and `AUTH_DATA` establish the session cookie used by both REST and
   Socket.IO.
 - `WORKER_ID` is required. Give every Windows print-service installation a unique,

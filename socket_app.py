@@ -6,9 +6,11 @@ guarded REST drain; printable content is always claimed from the durable
 Local Print Job API before it is sent to an exact Windows printer.
 """
 
+import ipaddress
 import json
 import logging
 import os
+import re
 import sys
 import time
 from logging.handlers import RotatingFileHandler
@@ -63,6 +65,13 @@ _drain_lock = Lock()
 _drain_running = False
 _drain_requested = False
 
+SOCKETIO_NAMESPACE_PATTERN = re.compile(
+    r"/(?:[A-Za-z0-9][A-Za-z0-9._-]{0,252})?\Z"
+)
+HOSTNAME_LABEL_PATTERN = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z"
+)
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -108,6 +117,73 @@ def build_http_base_url(cfg: dict[str, Any]) -> str:
                 return f"{parsed.scheme}://{parsed.netloc}"
 
     raise ValueError("Cannot determine HTTP base URL. Set FRAPPE_BASE_URL in config.json.")
+
+
+def _validated_socket_origin(cfg: dict[str, Any]) -> tuple[str, str]:
+    """Return a safe Socket.IO origin and its hostname."""
+    if not isinstance(cfg, dict):
+        raise ValueError("Socket.IO configuration must be a JSON object")
+
+    socket_url = cfg.get("FRAPPE_SOCKET_URL")
+    if (
+        not isinstance(socket_url, str)
+        or not socket_url
+        or socket_url != socket_url.strip()
+    ):
+        raise ValueError("FRAPPE_SOCKET_URL must be a complete HTTP(S) origin")
+
+    try:
+        parsed = urlparse(socket_url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("FRAPPE_SOCKET_URL has an invalid hostname or port") from exc
+
+    if parsed.scheme not in ("http", "https") or not hostname or not parsed.netloc:
+        raise ValueError("FRAPPE_SOCKET_URL must be a complete HTTP(S) origin")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("FRAPPE_SOCKET_URL cannot contain user information")
+    if parsed.netloc.endswith(":"):
+        raise ValueError("FRAPPE_SOCKET_URL has an invalid port")
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("FRAPPE_SOCKET_URL has an invalid port")
+    if parsed.path not in ("", "/") or parsed.params or parsed.query or parsed.fragment:
+        raise ValueError("FRAPPE_SOCKET_URL must not contain a path, query, or fragment")
+
+    try:
+        normalized_hostname = ipaddress.ip_address(hostname).compressed.lower()
+    except ValueError:
+        try:
+            normalized_hostname = hostname.encode("idna").decode("ascii").lower()
+        except UnicodeError as exc:
+            raise ValueError("FRAPPE_SOCKET_URL has an invalid hostname") from exc
+        labels = normalized_hostname.split(".")
+        if (
+            len(normalized_hostname) > 253
+            or any(not HOSTNAME_LABEL_PATTERN.fullmatch(label) for label in labels)
+        ):
+            raise ValueError("FRAPPE_SOCKET_URL has an invalid hostname")
+
+    return socket_url.rstrip("/"), normalized_hostname
+
+
+def _validated_namespace(namespace: Any) -> str:
+    if (
+        not isinstance(namespace, str)
+        or namespace != namespace.strip()
+        or not SOCKETIO_NAMESPACE_PATTERN.fullmatch(namespace)
+        or ".." in namespace
+    ):
+        raise ValueError("SOCKETIO_NAMESPACE must be '/' or one safe path segment")
+    return namespace
+
+
+def build_socketio_namespace(cfg: dict[str, Any]) -> str:
+    """Derive a Socket.IO namespace from the hostname or validate an override."""
+    _, hostname = _validated_socket_origin(cfg)
+    if "SOCKETIO_NAMESPACE" in cfg:
+        return _validated_namespace(cfg["SOCKETIO_NAMESPACE"])
+    return _validated_namespace(f"/{hostname}")
 
 
 def send_printers_to_server(printers: list[str], cfg: dict[str, Any]) -> bool:
@@ -373,7 +449,7 @@ def run_socketio_client(cfg: dict[str, Any], namespace: str) -> None:
         log.error("Print worker configuration error: %s", error)
         return
 
-    socket_url = str(cfg["FRAPPE_SOCKET_URL"]).rstrip("/")
+    socket_url, _ = _validated_socket_origin(cfg)
     socketio_path = str(cfg.get("SOCKETIO_PATH", "/socket.io")).lstrip("/")
     headers = {"Cookie": cookie_header}
 
@@ -398,24 +474,36 @@ def run_socketio_client(cfg: dict[str, Any], namespace: str) -> None:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-if __name__ == "__main__":
+def main(config_path: str = "config.json") -> int:
+    """Load configuration, validate the namespace, and run the middleware."""
+    global config_data
+
     print("\n" + ("=" * 60))
     print("  Local Printers App - Starting up")
     print(f"  Logs folder: {LOG_DIR}")
     print("=" * 60 + "\n")
 
-    config_path = "config.json"
     config_data = load_config(config_path)
 
-    NAMESPACE = str(config_data.get("FRAPPE_SOCKET_URL") or "").strip().rstrip("/")
-    # TODO: use this if bench has one site on it and for older erpnext versions
-    # NAMESPACE = "/"  
-    print(f"  Subscribed namespace: {NAMESPACE}\n")
+    try:
+        namespace = build_socketio_namespace(config_data)
+    except (TypeError, ValueError) as exc:
+        error = bounded_printer_error(exc)
+        print(f"[CONFIG] Socket.IO configuration error: {error}")
+        log.error("Socket.IO configuration error: %s", error)
+        return 2
 
-    register_handlers(NAMESPACE)
+    print(f"  Subscribed namespace: {namespace}\n")
+
+    register_handlers(namespace)
 
     try:
-        run_socketio_client(config_data, NAMESPACE)
+        run_socketio_client(config_data, namespace)
     except KeyboardInterrupt:
         log.info("Shutting down...")
         sio.disconnect()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

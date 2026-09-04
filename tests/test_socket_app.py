@@ -573,6 +573,112 @@ class ConfigurationSampleTests(unittest.TestCase):
         self.assertEqual(config["API_SECRET"], "")
         self.assertEqual(config["AUTH_DATA"]["pwd"], "replace-with-worker-password")
 
+    def test_real_sample_entrypoint_connects_to_hostname_namespace(self):
+        module = load_socket_app()
+        self.assertTrue(hasattr(module, "main"), "socket_app must expose its real entrypoint")
+        sample_path = Path(__file__).resolve().parents[1] / "config copy.json"
+        socket_client = FakeSocketClient()
+        session = Mock(post=Mock())
+
+        with (
+            patch.object(
+                module,
+                "authenticate_http_session",
+                return_value=(session, "sid=dummy-session"),
+            ),
+            patch.object(module, "PrintJobClient", return_value=object()),
+            patch.object(module, "sio", socket_client),
+        ):
+            exit_code = module.main(str(sample_path))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(
+            socket_client.connect_calls[0][1]["namespaces"],
+            ["/ourcity.s.frappe.cloud"],
+        )
+        self.assertTrue(socket_client.handlers)
+        self.assertEqual(
+            {namespace for _, _, namespace in socket_client.handlers},
+            {"/ourcity.s.frappe.cloud"},
+        )
+
+    def test_namespace_derivation_validates_url_port_and_explicit_setting(self):
+        module = load_socket_app()
+        self.assertTrue(
+            hasattr(module, "build_socketio_namespace"),
+            "socket_app must validate and derive Socket.IO namespaces",
+        )
+
+        self.assertEqual(
+            module.build_socketio_namespace(
+                {"FRAPPE_SOCKET_URL": "https://OurCity.S.Frappe.Cloud:8443/"}
+            ),
+            "/ourcity.s.frappe.cloud",
+        )
+        self.assertEqual(
+            module.build_socketio_namespace(
+                {
+                    "FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud",
+                    "SOCKETIO_NAMESPACE": "/custom-site",
+                }
+            ),
+            "/custom-site",
+        )
+
+        invalid_configs = [
+            {"FRAPPE_SOCKET_URL": ""},
+            {"FRAPPE_SOCKET_URL": "ourcity.s.frappe.cloud"},
+            {"FRAPPE_SOCKET_URL": "ftp://ourcity.s.frappe.cloud"},
+            {"FRAPPE_SOCKET_URL": "https://"},
+            {"FRAPPE_SOCKET_URL": "https://worker:secret@ourcity.s.frappe.cloud"},
+            {"FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud:"},
+            {"FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud:70000"},
+            {"FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud/socket"},
+            {
+                "FRAPPE_SOCKET_URL": "https://invalid host.example",
+                "SOCKETIO_NAMESPACE": "/valid-site",
+            },
+            {
+                "FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud",
+                "SOCKETIO_NAMESPACE": "ourcity.s.frappe.cloud",
+            },
+            {
+                "FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud",
+                "SOCKETIO_NAMESPACE": "//ourcity.s.frappe.cloud",
+            },
+            {
+                "FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud",
+                "SOCKETIO_NAMESPACE": "/ourcity.s.frappe.cloud?unsafe=true",
+            },
+        ]
+        for config in invalid_configs:
+            with self.subTest(config=config), self.assertRaises(ValueError):
+                module.build_socketio_namespace(config)
+
+    def test_invalid_socket_configuration_stops_entrypoint_before_socket_setup(self):
+        module = load_socket_app()
+        self.assertTrue(hasattr(module, "main"), "socket_app must expose its real entrypoint")
+        invalid_configs = [
+            {"FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud:invalid"},
+            {
+                "FRAPPE_SOCKET_URL": "https://ourcity.s.frappe.cloud",
+                "SOCKETIO_NAMESPACE": "ourcity.s.frappe.cloud",
+            },
+        ]
+
+        for config in invalid_configs:
+            with (
+                self.subTest(config=config),
+                patch.object(module, "load_config", return_value=config),
+                patch.object(module, "register_handlers") as register,
+                patch.object(module, "run_socketio_client") as run,
+            ):
+                exit_code = module.main("invalid-config.json")
+
+            self.assertEqual(exit_code, 2)
+            register.assert_not_called()
+            run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
