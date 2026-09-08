@@ -4,7 +4,7 @@
     "API_SECRET": "your-api-secret",
     "EDGE_PATH": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
     "SUMATRA_PDF_PATH": "C:\\Program Files\\SumatraPDF\\SumatraPDF.exe",
-    "POLL_INTERVAL_SECONDS": 3,
+    "POLL_INTERVAL_SECONDS": 2,
     "MAX_PRINT_RETRIES": 3,
     "STALE_PRINTING_SECONDS": 120,
     "RESTAURANT_NAME": "Doh Myot Daw BBQ & Restaurant"
