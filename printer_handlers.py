@@ -85,6 +85,39 @@ def save_pdf_from_base64(pdf_base64: str) -> str | None:
         return None
 
 
+def print_single_job(job: dict, config_data: dict) -> str:
+    """Print one queue job and raise when decode or physical printing fails."""
+    pdf_base64 = job.get("pdf_base64")
+    printer_name = job.get("printer_name") or job.get("printer")
+
+    if not pdf_base64:
+        raise ValueError("Print job has no pdf_base64")
+    if not printer_name:
+        raise ValueError("Print job has no printer name")
+
+    pdf_path = save_pdf_from_base64(pdf_base64)
+    if not pdf_path:
+        raise ValueError("Failed to decode/save print job PDF")
+
+    sumatra_pdf_path = config_data.get(
+        "SUMATRA_PDF_PATH", r"C:\Program Files\SumatraPDF\SumatraPDF.exe"
+    )
+
+    try:
+        print_pdf_silent(
+            pdf_path,
+            printer_name,
+            sumatra_pdf_path,
+            raise_on_error=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(
+            f"SumatraPDF returned exit code {exc.returncode}"
+        ) from exc
+
+    return printer_name
+
+
 def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
     """
     Process a list of print jobs received from the Frappe server.
@@ -99,10 +132,6 @@ def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
 
     Returns a list of printer names that were printed to.
     """
-    sumatra_pdf_path = config_data.get(
-        "SUMATRA_PDF_PATH", r"C:\Program Files\SumatraPDF\SumatraPDF.exe"
-    )
-
     printed_to: list[str] = []
 
     if not isinstance(jobs, list):
@@ -129,33 +158,30 @@ def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
 
         log.info(
             "Job %d/%d – invoice=%s printer=%s format=%s is_cashier=%s pdf_b64_len=%s",
-            i, len(jobs), invoice_name, printer_name, print_format, is_cashier,
+            i,
+            len(jobs),
+            invoice_name,
+            printer_name,
+            print_format,
+            is_cashier,
             len(pdf_base64) if pdf_base64 else 0,
         )
 
         if not pdf_base64:
-            print(f"  ⚠️  SKIPPED – no PDF content")
+            print("  ⚠️  SKIPPED – no PDF content")
             log.warning("Job for invoice %s has no PDF, skipping.", invoice_name)
             continue
 
         if not printer_name:
-            print(f"  ⚠️  SKIPPED – no printer name")
+            print("  ⚠️  SKIPPED – no printer name")
             log.warning("Job for invoice %s has no printer, skipping.", invoice_name)
             continue
 
-        pdf_path = save_pdf_from_base64(pdf_base64)
-        if pdf_path:
-            print_pdf_silent(pdf_path, printer_name, sumatra_pdf_path)
-            printed_to.append(printer_name)
-
-            # Clean up temp PDF
-            try:
-                # os.remove(pdf_path)
-                log.info("Cleaned up temp PDF: %s", pdf_path)
-            except OSError:
-                pass
-        else:
-            print(f"  ❌ PDF save failed – nothing sent to printer")
+        try:
+            printed_to.append(print_single_job(job, config_data))
+        except Exception as exc:
+            print(f"  ❌ Printing failed: {exc}")
+            log.error("Job for invoice %s failed: %s", invoice_name, exc)
 
     print(f"\n{'='*60}")
     print(f"[JOBS] Done. Printed to: {printed_to if printed_to else 'NONE'}")
