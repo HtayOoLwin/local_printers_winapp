@@ -156,3 +156,54 @@ class FrappeQueueClient:
         return dict(
             self._request('POST', self._resource_path('Kitchen Print Queue'), json=payload) or {}
         )
+
+    def list_cashier_retryable(self, max_retries: int) -> list[dict]:
+        params = {
+            'fields': json.dumps([
+                'name', 'sales_invoice', 'sales_order', 'printer_name',
+                'status', 'retry_count', 'last_error', 'creation', 'modified',
+            ]),
+            'filters': json.dumps([
+                ['Cashier Print Queue', 'status', 'in', ['Pending', 'Error']],
+                ['Cashier Print Queue', 'retry_count', '<', int(max_retries)],
+            ]),
+            'order_by': 'creation asc',
+            'limit_page_length': 20,
+        }
+        data = self._request(
+            'GET',
+            self._resource_path('Cashier Print Queue'),
+            params=params,
+        )
+        return list(data or [])
+
+    def list_cashier_printing(self) -> list[dict]:
+        params = {
+            'fields': json.dumps(['name', 'status', 'retry_count', 'modified']),
+            'filters': json.dumps([
+                ['Cashier Print Queue', 'status', '=', 'Printing'],
+            ]),
+            'order_by': 'modified asc',
+            'limit_page_length': 100,
+        }
+        data = self._request(
+            'GET',
+            self._resource_path('Cashier Print Queue'),
+            params=params,
+        )
+        return list(data or [])
+
+    def update_cashier_queue(self, name: str, values: dict) -> dict:
+        return dict(
+            self._request(
+                'PUT',
+                self._resource_path('Cashier Print Queue', name),
+                json=values,
+            )
+            or {}
+        )
+
+    def get_sales_invoice(self, name: str) -> dict:
+        return dict(
+            self._request('GET', self._resource_path('Sales Invoice', name)) or {}
+        )
