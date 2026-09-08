@@ -2,7 +2,7 @@
     "FRAPPE_BASE_URL": "https://ourcity.s.frappe.cloud",
     "API_KEY": "your-api-key",
     "API_SECRET": "your-api-secret",
-    "WKHTMLTOPDF": "C:\\Program Files\\wkhtmltopdf\\bin\\wkhtmltopdf.exe",
+    "EDGE_PATH": "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
     "SUMATRA_PDF_PATH": "C:\\Program Files\\SumatraPDF\\SumatraPDF.exe",
     "POLL_INTERVAL_SECONDS": 3,
     "MAX_PRINT_RETRIES": 3,
