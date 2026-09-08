@@ -185,6 +185,12 @@ def start_cashier_polling(cfg: dict[str, Any]) -> Thread | None:
     return thread
 
 
+def legacy_socket_configured(cfg: dict[str, Any]) -> bool:
+    """Return whether the original Socket.IO/login configuration is complete."""
+    required = ("LOGIN_URL", "AUTH_DATA", "FRAPPE_SOCKET_URL")
+    return all(cfg.get(key) for key in required)
+
+
 def extract_jobs(payload: Any) -> tuple[list[dict[str, Any]], str]:
     """
     Normalise any payload shape coming from utils.py into
@@ -358,7 +364,13 @@ if __name__ == "__main__":
     start_cashier_polling(config_data)
 
     try:
-        run_socketio_client(config_data, NAMESPACE)
+        if legacy_socket_configured(config_data):
+            run_socketio_client(config_data, NAMESPACE)
+        else:
+            print("[SOCKET] Legacy Socket.IO disabled; cashier polling only.")
+            log.info("Legacy Socket.IO disabled; cashier polling only.")
+            while not stop_event.wait(1):
+                pass
     except KeyboardInterrupt:
         log.info("Shutting down...")
     finally:
