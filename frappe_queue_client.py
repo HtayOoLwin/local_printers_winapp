@@ -85,6 +85,24 @@ class FrappeQueueClient:
         data = self._request('GET', self._resource_path('Sales Order'), params=params)
         return list(data or [])
 
+    def list_draft_sales_orders(self, limit: int = 500) -> list[dict]:
+        params = {
+            'fields': json.dumps([
+                'name',
+                'creation',
+                'modified',
+                'custom_kitchen_queue_created',
+                'custom_kitchen_print_snapshot',
+            ]),
+            'filters': json.dumps([
+                ['Sales Order', 'docstatus', '=', 0],
+            ]),
+            'order_by': 'modified desc',
+            'limit_page_length': int(limit),
+        }
+        data = self._request('GET', self._resource_path('Sales Order'), params=params)
+        return list(data or [])
+
     def get(self, name: str) -> dict:
         return dict(self._request('GET', self._resource_path('Kitchen Print Queue', name)) or {})
 
@@ -100,6 +118,19 @@ class FrappeQueueClient:
                 'PUT',
                 self._resource_path('Sales Order', name),
                 json={'custom_kitchen_queue_created': 1},
+            )
+            or {}
+        )
+
+    def update_sales_order_kitchen_state(self, name: str, snapshot: str) -> dict:
+        return dict(
+            self._request(
+                'PUT',
+                self._resource_path('Sales Order', name),
+                json={
+                    'custom_kitchen_queue_created': 1,
+                    'custom_kitchen_print_snapshot': snapshot,
+                },
             )
             or {}
         )
