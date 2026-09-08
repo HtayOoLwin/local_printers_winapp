@@ -277,22 +277,22 @@ def _ensure_custom_field(
     fieldname: str,
     fieldtype: str = "Data",
     options: str | None = None,
+    properties: dict | None = None,
 ) -> None:
     custom_field_name = f"{dt}-{fieldname}"
     if client.exists("Custom Field", custom_field_name):
         print(f"[OK] {dt}.{fieldname} already exists")
         return
 
-    client.create(
-        "Custom Field",
-        build_custom_field_payload(
-            dt,
-            label,
-            fieldname,
-            fieldtype,
-            options=options,
-        ),
+    payload = build_custom_field_payload(
+        dt,
+        label,
+        fieldname,
+        fieldtype,
+        options=options,
     )
+    payload.update(properties or {})
+    client.create("Custom Field", payload)
     print(f"[CREATED] {dt}.{fieldname}")
 
 
@@ -324,6 +324,14 @@ def ensure_setup(client: SetupClient, module: str = "Selling") -> None:
         label="Kitchen Note",
         fieldname="custom_kitchen_note",
         fieldtype="Small Text",
+    )
+    _ensure_custom_field(
+        client,
+        dt="Sales Order",
+        label="Kitchen Queue Created",
+        fieldname="custom_kitchen_queue_created",
+        fieldtype="Check",
+        properties={"default": "0", "hidden": 1},
     )
 
     if client.exists("DocType", "Kitchen Print Queue"):
@@ -446,8 +454,8 @@ def main(argv: list[str] | None = None) -> int:
     ensure_setup(client, module)
     ensure_kitchen_counters(client, default_printer=default_printer)
     sync_item_routing(client)
-    ensure_server_script(client, load_server_script())
     print("ERPNext kitchen queue setup complete.")
+    print("No Server Script is required; the Windows worker discovers new Draft Sales Orders.")
     print("Printer assignments remain editable in Kitchen Counter > Printer Name.")
     return 0
 
