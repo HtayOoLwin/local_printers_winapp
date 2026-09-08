@@ -88,6 +88,34 @@ def test_existing_sales_order_item_fields_are_not_recreated():
     assert "Item-custom_kitchen_counter" in created_custom_fields
 
 
+def test_ensure_setup_creates_sales_order_queue_marker_field():
+    class FakeClient:
+        def __init__(self):
+            self.created = []
+
+        def exists(self, doctype, name):
+            return False
+
+        def create(self, doctype, payload):
+            self.created.append((doctype, payload))
+            return payload
+
+    client = FakeClient()
+    setup.ensure_setup(client, "Selling")
+
+    marker = [
+        payload
+        for dt, payload in client.created
+        if dt == "Custom Field"
+        and payload.get("dt") == "Sales Order"
+        and payload.get("fieldname") == "custom_kitchen_queue_created"
+    ]
+    assert len(marker) == 1
+    assert marker[0]["fieldtype"] == "Check"
+    assert marker[0]["default"] == "0"
+    assert marker[0]["hidden"] == 1
+
+
 def test_build_server_script_payload_targets_sales_order_after_insert():
     payload = setup.build_server_script_payload("print(123)")
     assert payload == {
