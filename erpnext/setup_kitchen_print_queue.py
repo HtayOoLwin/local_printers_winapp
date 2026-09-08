@@ -180,7 +180,7 @@ def ensure_setup(client: SetupClient, module: str = "Selling") -> None:
 
 
 def load_config(path: str = "config.json") -> dict:
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, "r", encoding="utf-8-sig") as fh:
         return json.load(fh)
 
 
