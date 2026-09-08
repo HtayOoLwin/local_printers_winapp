@@ -10,7 +10,7 @@ from typing import Callable
 
 from frappe_queue_client import AuthenticationError, FrappeQueueClient
 from kitchen_queue import build_error_update, is_retryable, parse_items_json, validate_printer_name
-from kitchen_ticket import build_ticket_html, render_html_to_pdf
+from kitchen_ticket import build_ticket_html, render_html_to_pdf, render_html_to_pdf_edge
 
 
 LOG_DIR = Path(__file__).resolve().parent / 'logs'
@@ -55,6 +55,18 @@ def _default_print_pdf(pdf_path: str, printer_name: str, sumatra_pdf_path: str) 
 
 def _normalized(value) -> str:
     return str(value or '').strip()
+
+
+def _resolve_pdf_renderer(config: dict):
+    edge_path = _normalized(config.get('EDGE_PATH'))
+    if edge_path:
+        return render_html_to_pdf_edge, edge_path
+
+    wkhtmltopdf_path = _normalized(config.get('WKHTMLTOPDF'))
+    if wkhtmltopdf_path:
+        return render_html_to_pdf, wkhtmltopdf_path
+
+    raise ValueError('Missing PDF renderer: set EDGE_PATH or WKHTMLTOPDF')
 
 
 def discover_sales_orders(client: FrappeQueueClient) -> int:
@@ -140,7 +152,7 @@ def process_queue_record(
     config: dict,
     installed_printers: list[str],
     *,
-    render_pdf: Callable[[str, str], str] = render_html_to_pdf,
+    render_pdf: Callable[[str, str], str] | None = None,
     print_pdf: Callable[[str, str, str], None] | None = None,
 ) -> None:
     max_retries = int(config.get('MAX_PRINT_RETRIES', 3))
@@ -163,7 +175,9 @@ def process_queue_record(
             items,
             str(config.get('RESTAURANT_NAME') or 'Restaurant'),
         )
-        pdf_path = render_pdf(html, str(config['WKHTMLTOPDF']))
+        renderer, renderer_path = _resolve_pdf_renderer(config)
+        renderer = render_pdf or renderer
+        pdf_path = renderer(html, renderer_path)
         printer_func = print_pdf or _default_print_pdf
         printer_func(pdf_path, printer_name, str(config['SUMATRA_PDF_PATH']))
 
@@ -229,9 +243,9 @@ def run_worker(config_path: str = 'config.json') -> None:
         'FRAPPE_BASE_URL',
         'API_KEY',
         'API_SECRET',
-        'WKHTMLTOPDF',
         'SUMATRA_PDF_PATH',
     )
+    renderer, renderer_path = _resolve_pdf_renderer(config)
     interval = max(1, int(config.get('POLL_INTERVAL_SECONDS', 3)))
     max_retries = max(1, int(config.get('MAX_PRINT_RETRIES', 3)))
     stale_seconds = max(30, int(config.get('STALE_PRINTING_SECONDS', 120)))
@@ -245,6 +259,7 @@ def run_worker(config_path: str = 'config.json') -> None:
     print('=' * 60)
     print(' Kitchen Print Queue Worker')
     print(f" Site: {str(config['FRAPPE_BASE_URL']).rstrip('/')}")
+    print(f' Renderer: {renderer.__name__} -> {renderer_path}')
     print(f' Poll: {interval}s | Max retries: {max_retries}')
     print('=' * 60)
 
