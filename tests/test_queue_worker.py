@@ -152,79 +152,216 @@ def test_recover_stale_printing_marks_old_jobs_error():
     assert client.updates[0][1]['status'] == 'Error'
 
 
-def test_discover_sales_orders_builds_queue_by_counter_and_marks_order_queued():
-    class DiscoveryClient:
-        def __init__(self):
-            self.created = []
-            self.marked = []
+def _snapshot(items):
+    return json.dumps({'version': 1, 'items': items}, ensure_ascii=False, sort_keys=True)
 
-        def list_unqueued_sales_orders(self):
-            return [{'name': 'SAL-ORD-1'}]
 
-        def get_sales_order(self, name):
-            assert name == 'SAL-ORD-1'
-            return {
-                'name': name,
-                'items': [
-                    {
-                        'item_code': 'BQ00011',
-                        'item_name': 'Black Chicken',
-                        'qty': 1,
-                        'uom': 'Plate',
-                        'stock_uom': 'Plate',
-                        'custom_kitchen_counter': '0',
-                        'custom_kitchen_note': 'No spicy',
-                    },
-                    {
-                        'item_code': 'K00037',
-                        'item_name': 'S.F 12',
-                        'qty': 2,
-                        'uom': 'Plate',
-                        'stock_uom': 'Plate',
-                        'custom_kitchen_counter': '',
-                        'custom_kitchen_note': '',
-                    },
-                ],
-            }
+class DiscoveryClient:
+    def __init__(self, sales_order):
+        self.sales_order = sales_order
+        self.created = []
+        self.marked = []
+        self.state_updates = []
 
-        def get_item(self, item_code):
-            if item_code == 'BQ00011':
-                return {
-                    'name': item_code,
-                    'item_group': 'Barbecue',
-                    'custom_kitchen_counter': '',
-                }
-            return {
-                'name': item_code,
-                'item_group': 'Kitchen',
-                'custom_kitchen_counter': 'Kitchen',
-            }
+    def list_unqueued_sales_orders(self):
+        return [{'name': self.sales_order['name']}]
 
-        def get_kitchen_counter(self, counter):
-            return {'name': counter, 'custom_printer_name': 'Kitchen Printer'}
+    def list_draft_sales_orders(self):
+        return [{
+            'name': self.sales_order['name'],
+            'creation': self.sales_order.get('creation'),
+            'modified': self.sales_order.get('modified'),
+            'custom_kitchen_queue_created': self.sales_order.get('custom_kitchen_queue_created', 0),
+            'custom_kitchen_print_snapshot': self.sales_order.get('custom_kitchen_print_snapshot', ''),
+        }]
 
-        def queue_exists(self, queue_key):
-            return False
+    def get_sales_order(self, name):
+        assert name == self.sales_order['name']
+        return self.sales_order
 
-        def create_queue(self, payload):
-            self.created.append(dict(payload))
-            return {'name': f'KPQ-{len(self.created):05d}', **payload}
+    def get_item(self, item_code):
+        groups = {
+            'BQ00011': 'Barbecue',
+            'K00037': 'Kitchen',
+            'B00001': 'Bar',
+        }
+        return {
+            'name': item_code,
+            'item_group': groups[item_code],
+            'custom_kitchen_counter': groups[item_code],
+        }
 
-        def mark_sales_order_queued(self, name):
-            self.marked.append(name)
-            return {'name': name, 'custom_kitchen_queue_created': 1}
+    def get_kitchen_counter(self, counter):
+        return {'name': counter, 'custom_printer_name': 'Kitchen Printer'}
 
-    client = DiscoveryClient()
+    def queue_exists(self, queue_key):
+        return any(row['queue_key'] == queue_key for row in self.created)
+
+    def create_queue(self, payload):
+        self.created.append(dict(payload))
+        return {'name': f'KPQ-{len(self.created):05d}', **payload}
+
+    def mark_sales_order_queued(self, name):
+        self.marked.append(name)
+        return {'name': name, 'custom_kitchen_queue_created': 1}
+
+    def update_sales_order_kitchen_state(self, name, snapshot):
+        self.state_updates.append((name, snapshot))
+        self.sales_order['custom_kitchen_queue_created'] = 1
+        self.sales_order['custom_kitchen_print_snapshot'] = snapshot
+        return {
+            'name': name,
+            'custom_kitchen_queue_created': 1,
+            'custom_kitchen_print_snapshot': snapshot,
+        }
+
+
+def test_discover_new_sales_order_builds_full_queue_by_counter_and_saves_snapshot():
+    sales_order = {
+        'name': 'SAL-ORD-1',
+        'creation': '2026-09-08 10:00:00',
+        'modified': '2026-09-08 10:00:01.123456',
+        'custom_kitchen_queue_created': 0,
+        'custom_kitchen_print_snapshot': '',
+        'items': [
+            {
+                'item_code': 'BQ00011',
+                'item_name': 'Black Chicken',
+                'qty': 1,
+                'uom': 'Plate',
+                'stock_uom': 'Plate',
+                'custom_kitchen_counter': '0',
+                'custom_kitchen_note': 'No spicy',
+            },
+            {
+                'item_code': 'K00037',
+                'item_name': 'S.F 12',
+                'qty': 2,
+                'uom': 'Plate',
+                'stock_uom': 'Plate',
+                'custom_kitchen_counter': '',
+                'custom_kitchen_note': '',
+            },
+        ],
+    }
+    client = DiscoveryClient(sales_order)
+
     count = discover_sales_orders(client)
 
     assert count == 2
-    assert client.marked == ['SAL-ORD-1']
     assert {row['kitchen_counter'] for row in client.created} == {'Barbecue', 'Kitchen'}
-    assert {row['queue_key'] for row in client.created} == {
-        'SAL-ORD-1|Barbecue',
-        'SAL-ORD-1|Kitchen',
-    }
     barbecue = next(row for row in client.created if row['kitchen_counter'] == 'Barbecue')
     assert barbecue['printer_name'] == 'Kitchen Printer'
     assert barbecue['status'] == 'Pending'
     assert json.loads(barbecue['items_json'])[0]['note'] == 'No spicy'
+    assert client.state_updates and client.state_updates[-1][0] == 'SAL-ORD-1'
+    saved = json.loads(client.state_updates[-1][1])
+    assert saved['version'] == 1
+    assert {row['counter'] for row in saved['items']} == {'Barbecue', 'Kitchen'}
+
+
+def test_existing_sales_order_qty_increase_prints_only_positive_delta():
+    previous = _snapshot([
+        {
+            'counter': 'Kitchen',
+            'item_code': 'K00037',
+            'item_name': 'S.F 12',
+            'qty': 1.0,
+            'uom': 'Plate',
+            'note': '',
+        }
+    ])
+    sales_order = {
+        'name': 'SAL-ORD-2',
+        'creation': '2026-09-08 10:00:00',
+        'modified': '2026-09-08 12:20:00.123456',
+        'custom_kitchen_queue_created': 1,
+        'custom_kitchen_print_snapshot': previous,
+        'items': [
+            {
+                'item_code': 'K00037',
+                'item_name': 'S.F 12',
+                'qty': 3,
+                'uom': 'Plate',
+                'custom_kitchen_counter': 'Kitchen',
+                'custom_kitchen_note': '',
+            }
+        ],
+    }
+    client = DiscoveryClient(sales_order)
+
+    count = discover_sales_orders(client)
+
+    assert count == 1
+    delta_items = json.loads(client.created[0]['items_json'])
+    assert len(delta_items) == 1
+    assert delta_items[0]['item_code'] == 'K00037'
+    assert delta_items[0]['qty'] == 2.0
+    assert client.created[0]['queue_key'].startswith('SAL-ORD-2|Kitchen|')
+    saved = json.loads(client.state_updates[-1][1])
+    assert saved['items'][0]['qty'] == 3.0
+
+
+def test_existing_sales_order_qty_decrease_updates_snapshot_without_printing():
+    previous = _snapshot([
+        {
+            'counter': 'Kitchen',
+            'item_code': 'K00037',
+            'item_name': 'S.F 12',
+            'qty': 3.0,
+            'uom': 'Plate',
+            'note': '',
+        }
+    ])
+    sales_order = {
+        'name': 'SAL-ORD-3',
+        'modified': '2026-09-08 12:21:00.123456',
+        'custom_kitchen_queue_created': 1,
+        'custom_kitchen_print_snapshot': previous,
+        'items': [
+            {
+                'item_code': 'K00037',
+                'item_name': 'S.F 12',
+                'qty': 2,
+                'uom': 'Plate',
+                'custom_kitchen_counter': 'Kitchen',
+                'custom_kitchen_note': '',
+            }
+        ],
+    }
+    client = DiscoveryClient(sales_order)
+
+    count = discover_sales_orders(client)
+
+    assert count == 0
+    assert client.created == []
+    saved = json.loads(client.state_updates[-1][1])
+    assert saved['items'][0]['qty'] == 2.0
+
+
+def test_existing_marked_order_without_snapshot_is_baselined_without_reprint():
+    sales_order = {
+        'name': 'SAL-ORD-OLD',
+        'modified': '2026-09-08 12:22:00.123456',
+        'custom_kitchen_queue_created': 1,
+        'custom_kitchen_print_snapshot': '',
+        'items': [
+            {
+                'item_code': 'K00037',
+                'item_name': 'S.F 12',
+                'qty': 4,
+                'uom': 'Plate',
+                'custom_kitchen_counter': 'Kitchen',
+                'custom_kitchen_note': '',
+            }
+        ],
+    }
+    client = DiscoveryClient(sales_order)
+
+    count = discover_sales_orders(client)
+
+    assert count == 0
+    assert client.created == []
+    assert client.state_updates and client.state_updates[-1][0] == 'SAL-ORD-OLD'
+    saved = json.loads(client.state_updates[-1][1])
+    assert saved['items'][0]['qty'] == 4.0
