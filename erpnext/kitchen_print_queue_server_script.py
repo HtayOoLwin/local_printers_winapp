@@ -11,14 +11,27 @@ missing_counter_items = []
 
 for row in doc.items:
     counter = row.get("custom_kitchen_counter")
-    if not counter:
+    counter = str(counter or "").strip()
+
+    if not counter or counter == "0":
         counter = frappe.db.get_value(
             "Item",
             row.item_code,
             "custom_kitchen_counter",
         )
+        counter = str(counter or "").strip()
 
-    if not counter:
+    if not counter or counter == "0":
+        item_group = frappe.db.get_value(
+            "Item",
+            row.item_code,
+            "item_group",
+        )
+        item_group = str(item_group or "").strip()
+        if item_group and frappe.db.exists("Kitchen Counter", item_group):
+            counter = item_group
+
+    if not counter or counter == "0":
         missing_counter_items.append(row.item_code)
         continue
 
