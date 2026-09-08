@@ -27,6 +27,9 @@ if not log.handlers:
     log.addHandler(file_handler)
 
 
+DEFAULT_GROUP_COUNTERS = {'Bar', 'Barbecue', 'Kitchen'}
+
+
 def load_config(config_path: str = 'config.json') -> dict:
     with open(config_path, 'r', encoding='utf-8-sig') as fh:
         return json.load(fh)
@@ -48,6 +51,87 @@ def _default_print_pdf(pdf_path: str, printer_name: str, sumatra_pdf_path: str) 
         sumatra_pdf_path,
         raise_on_error=True,
     )
+
+
+def _normalized(value) -> str:
+    return str(value or '').strip()
+
+
+def discover_sales_orders(client: FrappeQueueClient) -> int:
+    """Create durable queue rows for new Draft Sales Orders using only standard REST APIs."""
+    created = 0
+    for summary in client.list_unqueued_sales_orders():
+        sales_order = client.get_sales_order(summary['name'])
+        counter_items: dict[str, list[dict]] = {}
+        item_cache: dict[str, dict] = {}
+        missing_items: list[str] = []
+
+        for row in sales_order.get('items') or []:
+            counter = _normalized(row.get('custom_kitchen_counter'))
+            if counter in {'', '0'}:
+                item_code = str(row.get('item_code') or '')
+                if item_code not in item_cache:
+                    item_cache[item_code] = client.get_item(item_code)
+                item = item_cache[item_code]
+                counter = _normalized(item.get('custom_kitchen_counter'))
+                if counter in {'', '0'}:
+                    item_group = _normalized(item.get('item_group'))
+                    if item_group in DEFAULT_GROUP_COUNTERS:
+                        counter = item_group
+
+            if counter in {'', '0'}:
+                missing_items.append(str(row.get('item_code') or ''))
+                continue
+
+            counter_items.setdefault(counter, []).append(
+                {
+                    'item_code': row.get('item_code'),
+                    'item_name': row.get('item_name') or row.get('item_code'),
+                    'qty': row.get('qty'),
+                    'uom': row.get('uom') or row.get('stock_uom'),
+                    'note': row.get('custom_kitchen_note') or '',
+                }
+            )
+
+        if missing_items:
+            log.warning(
+                'Sales Order %s has item(s) without kitchen routing: %s',
+                sales_order.get('name'),
+                ', '.join(missing_items),
+            )
+
+        for counter, items in counter_items.items():
+            queue_key = f"{sales_order['name']}|{counter}"
+            if client.queue_exists(queue_key):
+                continue
+
+            counter_doc = client.get_kitchen_counter(counter)
+            printer_name = _normalized(counter_doc.get('custom_printer_name'))
+            status = 'Pending' if printer_name else 'Error'
+            last_error = (
+                ''
+                if printer_name
+                else f'Printer not configured for Kitchen Counter {counter}'
+            )
+            client.create_queue(
+                {
+                    'sales_order': sales_order['name'],
+                    'kitchen_counter': counter,
+                    'printer_name': printer_name,
+                    'items_json': json.dumps(items, ensure_ascii=False),
+                    'print_format': 'Kitchen Ticket',
+                    'status': status,
+                    'retry_count': 0,
+                    'last_error': last_error,
+                    'queue_key': queue_key,
+                }
+            )
+            created += 1
+            log.info('Queued %s -> %s -> %s', sales_order['name'], counter, printer_name)
+
+        client.mark_sales_order_queued(sales_order['name'])
+
+    return created
 
 
 def process_queue_record(
@@ -174,6 +258,10 @@ def run_worker(config_path: str = 'config.json') -> None:
 
     while True:
         try:
+            discovered = discover_sales_orders(client)
+            if discovered:
+                print(f'[QUEUE] Created {discovered} new kitchen queue job(s).')
+
             installed_printers = get_local_printers()
             rows = client.list_retryable(max_retries)
             if rows:
