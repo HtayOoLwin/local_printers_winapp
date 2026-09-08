@@ -144,17 +144,21 @@ def _parse_snapshot(value: str) -> list[dict] | None:
     return items
 
 
-def _item_identity(item: dict) -> tuple[str, str, str, str]:
+def _item_identity(item: dict) -> tuple[str, str, str]:
+    """Quantity identity intentionally excludes note text.
+
+    Editing a kitchen note must not make the existing quantity look newly ordered.
+    The current note is still carried onto a real positive-quantity delta ticket.
+    """
     return (
         _normalized(item.get('counter')),
         _normalized(item.get('item_code')),
         _normalized(item.get('uom')),
-        _normalized(item.get('note')),
     )
 
 
-def _aggregate_quantities(items: list[dict]) -> dict[tuple[str, str, str, str], float]:
-    totals: dict[tuple[str, str, str, str], float] = {}
+def _aggregate_quantities(items: list[dict]) -> dict[tuple[str, str, str], float]:
+    totals: dict[tuple[str, str, str], float] = {}
     for item in items:
         key = _item_identity(item)
         try:
@@ -166,10 +170,10 @@ def _aggregate_quantities(items: list[dict]) -> dict[tuple[str, str, str, str], 
 
 
 def _positive_delta_items(previous: list[dict], current: list[dict]) -> list[dict]:
-    """Return only positive quantity increases, grouped by counter/item/uom/note."""
+    """Return only positive quantity increases, grouped by counter/item/uom."""
     previous_qty = _aggregate_quantities(previous)
     current_qty = _aggregate_quantities(current)
-    representative: dict[tuple[str, str, str, str], dict] = {}
+    representative: dict[tuple[str, str, str], dict] = {}
     for item in current:
         representative[_item_identity(item)] = item
 
@@ -270,12 +274,40 @@ def _create_counter_queues(
     return created
 
 
-def discover_sales_orders(client: FrappeQueueClient) -> int:
+def _cache_modified(
+    modified_cache: dict[str, str] | None,
+    name: str,
+    fallback_modified: str,
+    update_result: dict | None = None,
+) -> None:
+    if modified_cache is None:
+        return
+    modified_cache[name] = (
+        _normalized((update_result or {}).get('modified'))
+        or _normalized(fallback_modified)
+    )
+
+
+def discover_sales_orders(
+    client: FrappeQueueClient,
+    *,
+    modified_cache: dict[str, str] | None = None,
+) -> int:
     """Queue full first prints and positive deltas for edited Draft Sales Orders."""
     created = 0
 
     for summary in client.list_draft_sales_orders():
-        sales_order = client.get_sales_order(summary['name'])
+        name = summary['name']
+        summary_modified = _normalized(summary.get('modified'))
+        if (
+            modified_cache is not None
+            and summary_modified
+            and modified_cache.get(name) == summary_modified
+        ):
+            continue
+
+        sales_order = client.get_sales_order(name)
+        source_modified = _normalized(sales_order.get('modified')) or summary_modified
         current_items = _route_sales_order_items(client, sales_order)
         current_snapshot = _snapshot_json(current_items)
         marker = int(sales_order.get('custom_kitchen_queue_created') or 0)
@@ -288,17 +320,20 @@ def discover_sales_orders(client: FrappeQueueClient) -> int:
                 _group_print_items(current_items),
                 delta=False,
             )
-            client.update_sales_order_kitchen_state(sales_order['name'], current_snapshot)
+            result = client.update_sales_order_kitchen_state(name, current_snapshot)
+            _cache_modified(modified_cache, name, source_modified, result)
             continue
 
         if previous_items is None:
             # Existing orders printed before delta tracking was deployed are baselined once.
-            client.update_sales_order_kitchen_state(sales_order['name'], current_snapshot)
-            log.info('Baselined kitchen snapshot for %s', sales_order['name'])
+            result = client.update_sales_order_kitchen_state(name, current_snapshot)
+            _cache_modified(modified_cache, name, source_modified, result)
+            log.info('Baselined kitchen snapshot for %s', name)
             continue
 
         previous_snapshot = _snapshot_json(previous_items)
         if previous_snapshot == current_snapshot:
+            _cache_modified(modified_cache, name, source_modified)
             continue
 
         delta_items = _positive_delta_items(previous_items, current_items)
@@ -310,8 +345,10 @@ def discover_sales_orders(client: FrappeQueueClient) -> int:
                 delta=True,
             )
 
-        # Decreases/removals intentionally do not print, but still become the new baseline.
-        client.update_sales_order_kitchen_state(sales_order['name'], current_snapshot)
+        # Decreases/removals/note-only edits intentionally do not print,
+        # but still become the new baseline.
+        result = client.update_sales_order_kitchen_state(name, current_snapshot)
+        _cache_modified(modified_cache, name, source_modified, result)
 
     return created
 
@@ -425,6 +462,7 @@ def run_worker(config_path: str = 'config.json') -> None:
         str(config['API_KEY']),
         str(config['API_SECRET']),
     )
+    modified_cache: dict[str, str] = {}
 
     print('=' * 60)
     print(' Kitchen Print Queue Worker')
@@ -443,7 +481,7 @@ def run_worker(config_path: str = 'config.json') -> None:
 
     while True:
         try:
-            discovered = discover_sales_orders(client)
+            discovered = discover_sales_orders(client, modified_cache=modified_cache)
             if discovered:
                 print(f'[QUEUE] Created {discovered} new kitchen queue job(s).')
 
