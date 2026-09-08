@@ -1,3 +1,9 @@
+import os
+import subprocess
+import threading
+import time
+
+import kitchen_ticket
 from kitchen_ticket import build_ticket_html
 
 
@@ -28,3 +34,36 @@ def test_build_ticket_html_escapes_user_content_and_has_no_prices():
     assert '999999' not in html
     assert '5000' not in html
     assert 'Grand Total' not in html
+
+
+def test_edge_renderer_waits_for_pdf_created_after_browser_process_returns(tmp_path, monkeypatch):
+    edge = tmp_path / 'msedge.exe'
+    edge.write_text('edge')
+    writer_threads = []
+
+    def fake_run(command, check):
+        pdf_arg = next(arg for arg in command if arg.startswith('--print-to-pdf='))
+        pdf_path = pdf_arg.split('=', 1)[1]
+
+        def delayed_write():
+            time.sleep(0.08)
+            with open(pdf_path, 'wb') as fh:
+                fh.write(b'%PDF-edge-test')
+
+        thread = threading.Thread(target=delayed_write)
+        thread.start()
+        writer_threads.append(thread)
+
+    monkeypatch.setattr(subprocess, 'run', fake_run)
+
+    pdf_path = kitchen_ticket.render_html_to_pdf_edge(
+        '<html><body>Kitchen</body></html>',
+        str(edge),
+        timeout_seconds=2,
+    )
+
+    for thread in writer_threads:
+        thread.join()
+
+    assert os.path.exists(pdf_path)
+    assert open(pdf_path, 'rb').read() == b'%PDF-edge-test'
