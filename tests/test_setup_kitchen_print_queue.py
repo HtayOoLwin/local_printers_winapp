@@ -101,7 +101,7 @@ def test_ensure_setup_creates_sales_order_queue_marker_field():
             return payload
 
     client = FakeClient()
-    setup.ensure_setup(client, "Selling")
+    marker_created = setup.ensure_setup(client, "Selling")
 
     marker = [
         payload
@@ -110,10 +110,35 @@ def test_ensure_setup_creates_sales_order_queue_marker_field():
         and payload.get("dt") == "Sales Order"
         and payload.get("fieldname") == "custom_kitchen_queue_created"
     ]
+    assert marker_created is True
     assert len(marker) == 1
     assert marker[0]["fieldtype"] == "Check"
     assert marker[0]["default"] == "0"
     assert marker[0]["hidden"] == 1
+
+
+def test_mark_existing_draft_sales_orders_queued():
+    class FakeClient:
+        def __init__(self):
+            self.updated = []
+
+        def list_records(self, doctype, *, fields, filters=None, limit=5000):
+            assert doctype == "Sales Order"
+            assert ["Sales Order", "docstatus", "=", 0] in filters
+            return [{"name": "SAL-ORD-OLD-1"}, {"name": "SAL-ORD-OLD-2"}]
+
+        def update(self, doctype, name, values):
+            self.updated.append((doctype, name, values))
+            return values
+
+    client = FakeClient()
+    count = setup.mark_existing_draft_sales_orders_queued(client)
+
+    assert count == 2
+    assert client.updated == [
+        ("Sales Order", "SAL-ORD-OLD-1", {"custom_kitchen_queue_created": 1}),
+        ("Sales Order", "SAL-ORD-OLD-2", {"custom_kitchen_queue_created": 1}),
+    ]
 
 
 def test_build_server_script_payload_targets_sales_order_after_insert():
