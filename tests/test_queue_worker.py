@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta
 import json
 
+import queue_worker
 from queue_worker import discover_sales_orders, process_queue_record, recover_stale_printing
 
 
@@ -48,6 +49,20 @@ def base_config():
         'WKHTMLTOPDF': 'wkhtmltopdf.exe',
         'SUMATRA_PDF_PATH': 'SumatraPDF.exe',
     }
+
+
+def test_resolve_pdf_renderer_uses_edge_when_configured():
+    renderer, path = queue_worker._resolve_pdf_renderer({
+        'EDGE_PATH': r'C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe'
+    })
+    assert renderer.__name__ == 'render_html_to_pdf_edge'
+    assert path.endswith('msedge.exe')
+
+
+def test_resolve_pdf_renderer_keeps_wkhtmltopdf_compatibility():
+    renderer, path = queue_worker._resolve_pdf_renderer({'WKHTMLTOPDF': 'wkhtmltopdf.exe'})
+    assert renderer.__name__ == 'render_html_to_pdf'
+    assert path == 'wkhtmltopdf.exe'
 
 
 def test_pending_claims_prints_and_marks_printed(tmp_path):
