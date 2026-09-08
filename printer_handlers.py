@@ -38,8 +38,14 @@ def get_local_printers() -> list[str]:
     return [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)]
 
 
-def print_pdf_silent(pdf_path: str, printer_name: str, sumatra_pdf_path: str):
-    """Print a PDF file silently using SumatraPDF and raise if printing fails."""
+def print_pdf_silent(
+    pdf_path: str,
+    printer_name: str,
+    sumatra_pdf_path: str,
+    *,
+    raise_on_error: bool = False,
+):
+    """Print a PDF silently; optionally propagate failures to queue callers."""
     command = (
         f'"{sumatra_pdf_path}" -print-to "{printer_name}" '
         f'-print-settings "noscale" "{pdf_path}"'
@@ -53,11 +59,13 @@ def print_pdf_silent(pdf_path: str, printer_name: str, sumatra_pdf_path: str):
     except subprocess.CalledProcessError as exc:
         print(f"[PRINT] ❌ SumatraPDF FAILED for printer '{printer_name}': {exc}")
         log.error("SumatraPDF failed for '%s': %s", printer_name, exc)
-        raise
+        if raise_on_error:
+            raise
     except Exception as exc:
         print(f"[PRINT] ❌ Unexpected error printing PDF: {exc}")
         log.error("Unexpected error printing PDF: %s", exc)
-        raise
+        if raise_on_error:
+            raise
 
 
 def save_pdf_from_base64(pdf_base64: str) -> str | None:
