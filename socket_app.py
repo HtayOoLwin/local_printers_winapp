@@ -72,7 +72,7 @@ def load_config(config_path: str) -> dict[str, Any]:
     """Load configuration from a JSON file."""
     print(f"[CONFIG] Loading config from '{config_path}' ...")
     try:
-        with open(config_path, "r", encoding="utf-8") as fh:
+        with open(config_path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
         print("[CONFIG] Configuration loaded successfully.")
         log.info("Configuration loaded from %s", config_path)
@@ -94,7 +94,7 @@ def get_local_printers() -> list[str]:
 def build_http_base_url(cfg: dict[str, Any]) -> str:
     """
     Derive the plain HTTP base URL for API calls.
-    FRAPPE_SOCKET_URL may point to a socketio port – use FRAPPE_BASE_URL
+    FRAPPE_SOCKET_URL may point to a socketio port â€“ use FRAPPE_BASE_URL
     when available, otherwise parse the host from LOGIN_URL / FRAPPE_SOCKET_URL.
     """
     base = str(cfg.get("FRAPPE_BASE_URL") or "").strip().rstrip("/")
@@ -109,6 +109,20 @@ def build_http_base_url(cfg: dict[str, Any]) -> str:
                 return f"{parsed.scheme}://{parsed.netloc}"
 
     raise ValueError("Cannot determine HTTP base URL. Set FRAPPE_BASE_URL in config.json.")
+
+
+def build_socket_namespace(cfg: dict[str, Any]) -> str:
+    """Build the Frappe Socket.IO namespace from the site hostname."""
+    socket_url = str(cfg.get("FRAPPE_SOCKET_URL") or "").strip()
+    parsed = urlparse(socket_url)
+
+    if not parsed.netloc:
+        raise ValueError(
+            "FRAPPE_SOCKET_URL must include scheme and hostname."
+        )
+
+    return f"/{parsed.netloc}"
+
 
 
 def send_printers_to_server(printers: list[str], cfg: dict[str, Any]) -> None:
@@ -205,19 +219,19 @@ def extract_jobs(payload: Any) -> tuple[list[dict[str, Any]], str]:
         return [], "unknown"
 
     if isinstance(payload, dict):
-        # Shape 1 – wrapped payload from document_print_event
+        # Shape 1 â€“ wrapped payload from document_print_event
         jobs = payload.get("jobs")
         if isinstance(jobs, list):
             invoice = str(payload.get("document_name") or "unknown")
             return jobs, invoice
-        # Shape 3 – bare single job dict
+        # Shape 3 â€“ bare single job dict
         if "pdf_base64" in payload:
             invoice = str(payload.get("invoice_name") or payload.get("document_name") or "unknown")
             return [payload], invoice
         return [], "unknown"
 
     if isinstance(payload, list):
-        # Shape 2 – legacy list from sales_invoice_submitted
+        # Shape 2 â€“ legacy list from sales_invoice_submitted
         invoice = "unknown"
         if payload and isinstance(payload[0], dict):
             invoice = str(
@@ -270,7 +284,7 @@ def process_print_event(event_name: str, payload: Any) -> None:
     jobs, invoice = extract_jobs(payload)
 
     if not jobs:
-        print("[EVENT] Empty or unrecognised payload – nothing to print.")
+        print("[EVENT] Empty or unrecognised payload â€“ nothing to print.")
         log.warning("No printable jobs found in '%s' payload: %s", event_name, payload)
         return
 
@@ -293,12 +307,12 @@ def process_print_event(event_name: str, payload: Any) -> None:
 
 
 def handle_document_print_event(data: Any) -> None:
-    """Primary event – new server contract (utils.py document_print_event)."""
+    """Primary event â€“ new server contract (utils.py document_print_event)."""
     process_print_event("document_print_event", data)
 
 
 def handle_sales_invoice_submitted(data: Any) -> None:
-    """Backward-compat event – utils.py still fires this for Sales Invoices."""
+    """Backward-compat event â€“ utils.py still fires this for Sales Invoices."""
     process_print_event("sales_invoice_submitted", data)
 
 
@@ -317,7 +331,7 @@ def run_socketio_client(cfg: dict[str, Any], namespace: str) -> None:
     """Connect to the Frappe realtime server and block until disconnected."""
     cookie_header = fetch_session_cookies(cfg)
     if not cookie_header:
-        print("[SOCKET] Cannot connect – no session cookies.")
+        print("[SOCKET] Cannot connect â€“ no session cookies.")
         log.error("Cannot connect without valid session cookies.")
         return
 
@@ -355,7 +369,7 @@ if __name__ == "__main__":
     config_path = "config.json"
     config_data = load_config(config_path)
 
-    NAMESPACE = str(config_data.get("FRAPPE_SOCKET_URL") or "").strip().rstrip("/")
+    NAMESPACE = build_socket_namespace(config_data)
     # TODO: use this if bench has one site on it and for older erpnext versions
     # NAMESPACE = "/"
     print(f"  Subscribed namespace: {NAMESPACE}\n")
@@ -377,3 +391,4 @@ if __name__ == "__main__":
         stop_event.set()
         if sio.connected:
             sio.disconnect()
+
