@@ -72,6 +72,19 @@ class FrappeQueueClient:
         data = self._request('GET', self._resource_path('Kitchen Print Queue'), params=params)
         return list(data or [])
 
+    def list_unqueued_sales_orders(self, limit: int = 20) -> list[dict]:
+        params = {
+            'fields': json.dumps(['name', 'creation']),
+            'filters': json.dumps([
+                ['Sales Order', 'docstatus', '=', 0],
+                ['Sales Order', 'custom_kitchen_queue_created', '=', 0],
+            ]),
+            'order_by': 'creation asc',
+            'limit_page_length': int(limit),
+        }
+        data = self._request('GET', self._resource_path('Sales Order'), params=params)
+        return list(data or [])
+
     def get(self, name: str) -> dict:
         return dict(self._request('GET', self._resource_path('Kitchen Print Queue', name)) or {})
 
@@ -80,3 +93,35 @@ class FrappeQueueClient:
 
     def get_sales_order(self, name: str) -> dict:
         return dict(self._request('GET', self._resource_path('Sales Order', name)) or {})
+
+    def mark_sales_order_queued(self, name: str) -> dict:
+        return dict(
+            self._request(
+                'PUT',
+                self._resource_path('Sales Order', name),
+                json={'custom_kitchen_queue_created': 1},
+            )
+            or {}
+        )
+
+    def get_item(self, name: str) -> dict:
+        return dict(self._request('GET', self._resource_path('Item', name)) or {})
+
+    def get_kitchen_counter(self, name: str) -> dict:
+        return dict(self._request('GET', self._resource_path('Kitchen Counter', name)) or {})
+
+    def queue_exists(self, queue_key: str) -> bool:
+        params = {
+            'fields': json.dumps(['name']),
+            'filters': json.dumps([
+                ['Kitchen Print Queue', 'queue_key', '=', queue_key],
+            ]),
+            'limit_page_length': 1,
+        }
+        data = self._request('GET', self._resource_path('Kitchen Print Queue'), params=params)
+        return bool(data)
+
+    def create_queue(self, payload: dict) -> dict:
+        return dict(
+            self._request('POST', self._resource_path('Kitchen Print Queue'), json=payload) or {}
+        )
