@@ -7,12 +7,68 @@ from urllib.parse import quote
 import requests
 
 
-def build_custom_field_payload() -> dict:
+def _system_manager_permissions() -> list[dict]:
+    return [
+        {
+            "role": "System Manager",
+            "read": 1,
+            "write": 1,
+            "create": 1,
+            "delete": 1,
+            "print": 1,
+            "email": 1,
+            "export": 1,
+            "share": 1,
+        }
+    ]
+
+
+def build_custom_field_payload(
+    dt: str,
+    label: str,
+    fieldname: str,
+    fieldtype: str = "Data",
+    *,
+    options: str | None = None,
+) -> dict:
+    payload = {
+        "dt": dt,
+        "label": label,
+        "fieldname": fieldname,
+        "fieldtype": fieldtype,
+    }
+    if options:
+        payload["options"] = options
+    return payload
+
+
+def build_kitchen_counter_doctype_payload(module: str = "Selling") -> dict:
     return {
-        "dt": "Kitchen Counter",
-        "label": "Printer Name",
-        "fieldname": "custom_printer_name",
-        "fieldtype": "Data",
+        "name": "Kitchen Counter",
+        "module": module,
+        "custom": 1,
+        "is_submittable": 0,
+        "track_changes": 1,
+        "allow_rename": 1,
+        "autoname": "field:counter_name",
+        "title_field": "counter_name",
+        "fields": [
+            {
+                "label": "Counter Name",
+                "fieldname": "counter_name",
+                "fieldtype": "Data",
+                "reqd": 1,
+                "unique": 1,
+                "in_list_view": 1,
+            },
+            {
+                "label": "Printer Name",
+                "fieldname": "custom_printer_name",
+                "fieldtype": "Data",
+                "in_list_view": 1,
+            },
+        ],
+        "permissions": _system_manager_permissions(),
     }
 
 
@@ -96,19 +152,7 @@ def build_queue_doctype_payload(module: str = "Selling") -> dict:
                 "unique": 1,
             },
         ],
-        "permissions": [
-            {
-                "role": "System Manager",
-                "read": 1,
-                "write": 1,
-                "create": 1,
-                "delete": 1,
-                "print": 1,
-                "email": 1,
-                "export": 1,
-                "share": 1,
-            }
-        ],
+        "permissions": _system_manager_permissions(),
     }
 
 
@@ -164,13 +208,62 @@ class SetupClient:
             ) from exc
 
 
-def ensure_setup(client: SetupClient, module: str = "Selling") -> None:
-    custom_field_name = "Kitchen Counter-custom_printer_name"
+def _ensure_custom_field(
+    client: SetupClient,
+    *,
+    dt: str,
+    label: str,
+    fieldname: str,
+    fieldtype: str = "Data",
+    options: str | None = None,
+) -> None:
+    custom_field_name = f"{dt}-{fieldname}"
     if client.exists("Custom Field", custom_field_name):
-        print("[OK] Kitchen Counter.custom_printer_name already exists")
+        print(f"[OK] {dt}.{fieldname} already exists")
+        return
+
+    client.create(
+        "Custom Field",
+        build_custom_field_payload(
+            dt,
+            label,
+            fieldname,
+            fieldtype,
+            options=options,
+        ),
+    )
+    print(f"[CREATED] {dt}.{fieldname}")
+
+
+def ensure_setup(client: SetupClient, module: str = "Selling") -> None:
+    if client.exists("DocType", "Kitchen Counter"):
+        print("[OK] Kitchen Counter already exists")
     else:
-        client.create("Custom Field", build_custom_field_payload())
-        print("[CREATED] Kitchen Counter.custom_printer_name")
+        client.create("DocType", build_kitchen_counter_doctype_payload(module))
+        print("[CREATED] Kitchen Counter")
+
+    _ensure_custom_field(
+        client,
+        dt="Item",
+        label="Kitchen Counter",
+        fieldname="custom_kitchen_counter",
+        fieldtype="Link",
+        options="Kitchen Counter",
+    )
+    _ensure_custom_field(
+        client,
+        dt="Sales Order Item",
+        label="Kitchen Counter",
+        fieldname="custom_kitchen_counter",
+        fieldtype="Data",
+    )
+    _ensure_custom_field(
+        client,
+        dt="Sales Order Item",
+        label="Kitchen Note",
+        fieldname="custom_kitchen_note",
+        fieldtype="Small Text",
+    )
 
     if client.exists("DocType", "Kitchen Print Queue"):
         print("[OK] Kitchen Print Queue already exists")
