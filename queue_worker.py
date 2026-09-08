@@ -42,7 +42,12 @@ def get_local_printers() -> list[str]:
 def _default_print_pdf(pdf_path: str, printer_name: str, sumatra_pdf_path: str) -> None:
     from printer_handlers import print_pdf_silent
 
-    print_pdf_silent(pdf_path, printer_name, sumatra_pdf_path)
+    print_pdf_silent(
+        pdf_path,
+        printer_name,
+        sumatra_pdf_path,
+        raise_on_error=True,
+    )
 
 
 def process_queue_record(
