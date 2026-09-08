@@ -17,7 +17,7 @@ import os
 import sys
 import time
 from logging.handlers import RotatingFileHandler
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Any
 from urllib.parse import urlparse
 
@@ -25,6 +25,7 @@ import requests
 import socketio
 import win32print
 
+from polling_client import run_polling_loop
 from printer_handlers import print_jobs
 
 # ---------------------------------------------------------------------------
@@ -61,6 +62,7 @@ sio = socketio.Client(reconnection=True, reconnection_delay=5)
 config_data: dict[str, Any] = {}
 _register_lock = Lock()
 _registered_once = False
+stop_event = Event()
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +160,29 @@ def fetch_session_cookies(cfg: dict[str, Any]) -> str | None:
         return None
 
 
+def start_cashier_polling(cfg: dict[str, Any]) -> Thread | None:
+    """Start BCN Print Job polling without changing legacy Socket.IO behavior."""
+    required = ("FRAPPE_BASE_URL", "API_KEY", "API_SECRET")
+    missing = [key for key in required if not str(cfg.get(key) or "").strip()]
+    if missing:
+        print(
+            "[CASHIER] Polling disabled; missing config: "
+            + ", ".join(missing)
+        )
+        log.warning("Cashier polling disabled; missing config keys: %s", missing)
+        return None
 
+    stop_event.clear()
+    thread = Thread(
+        target=run_polling_loop,
+        args=(cfg, get_local_printers, stop_event.is_set),
+        name="cashier-print-poller",
+        daemon=True,
+    )
+    thread.start()
+    print("[CASHIER] BCN Print Job polling started.")
+    log.info("BCN Print Job polling thread started.")
+    return thread
 
 
 def extract_jobs(payload: Any) -> tuple[list[dict[str, Any]], str]:
@@ -327,13 +351,17 @@ if __name__ == "__main__":
 
     NAMESPACE = str(config_data.get("FRAPPE_SOCKET_URL") or "").strip().rstrip("/")
     # TODO: use this if bench has one site on it and for older erpnext versions
-    # NAMESPACE = "/"  
+    # NAMESPACE = "/"
     print(f"  Subscribed namespace: {NAMESPACE}\n")
 
     register_handlers(NAMESPACE)
+    start_cashier_polling(config_data)
 
     try:
         run_socketio_client(config_data, NAMESPACE)
     except KeyboardInterrupt:
         log.info("Shutting down...")
-        sio.disconnect()
+    finally:
+        stop_event.set()
+        if sio.connected:
+            sio.disconnect()
