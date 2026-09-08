@@ -278,11 +278,11 @@ def _ensure_custom_field(
     fieldtype: str = "Data",
     options: str | None = None,
     properties: dict | None = None,
-) -> None:
+) -> bool:
     custom_field_name = f"{dt}-{fieldname}"
     if client.exists("Custom Field", custom_field_name):
         print(f"[OK] {dt}.{fieldname} already exists")
-        return
+        return False
 
     payload = build_custom_field_payload(
         dt,
@@ -294,9 +294,10 @@ def _ensure_custom_field(
     payload.update(properties or {})
     client.create("Custom Field", payload)
     print(f"[CREATED] {dt}.{fieldname}")
+    return True
 
 
-def ensure_setup(client: SetupClient, module: str = "Selling") -> None:
+def ensure_setup(client: SetupClient, module: str = "Selling") -> bool:
     if client.exists("DocType", "Kitchen Counter"):
         print("[OK] Kitchen Counter already exists")
     else:
@@ -325,7 +326,7 @@ def ensure_setup(client: SetupClient, module: str = "Selling") -> None:
         fieldname="custom_kitchen_note",
         fieldtype="Small Text",
     )
-    _ensure_custom_field(
+    marker_created = _ensure_custom_field(
         client,
         dt="Sales Order",
         label="Kitchen Queue Created",
@@ -339,6 +340,25 @@ def ensure_setup(client: SetupClient, module: str = "Selling") -> None:
     else:
         client.create("DocType", build_queue_doctype_payload(module))
         print("[CREATED] Kitchen Print Queue")
+
+    return marker_created
+
+
+def mark_existing_draft_sales_orders_queued(client: SetupClient) -> int:
+    rows = client.list_records(
+        "Sales Order",
+        fields=["name"],
+        filters=[["Sales Order", "docstatus", "=", 0]],
+        limit=5000,
+    )
+    for row in rows:
+        client.update(
+            "Sales Order",
+            row["name"],
+            {"custom_kitchen_queue_created": 1},
+        )
+    print(f"[QUEUE INIT] Marked {len(rows)} existing Draft Sales Order(s) as already seen.")
+    return len(rows)
 
 
 def _normalized(value) -> str:
@@ -451,7 +471,9 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     print(f"Site: {cfg['FRAPPE_BASE_URL']}")
-    ensure_setup(client, module)
+    marker_created = ensure_setup(client, module)
+    if marker_created:
+        mark_existing_draft_sales_orders_queued(client)
     ensure_kitchen_counters(client, default_printer=default_printer)
     sync_item_routing(client)
     print("ERPNext kitchen queue setup complete.")
