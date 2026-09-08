@@ -9,3 +9,5 @@ def test_socket_app_keeps_legacy_events_and_starts_cashier_poller():
     assert "run_polling_loop" in source
     assert "Thread(" in source
     assert "stop_event" in source
+    assert "legacy_socket_configured" in source
+    assert "stop_event.wait" in source
