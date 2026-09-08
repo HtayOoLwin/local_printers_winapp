@@ -334,6 +334,14 @@ def ensure_setup(client: SetupClient, module: str = "Selling") -> bool:
         fieldtype="Check",
         properties={"default": "0", "hidden": 1},
     )
+    _ensure_custom_field(
+        client,
+        dt="Sales Order",
+        label="Kitchen Print Snapshot",
+        fieldname="custom_kitchen_print_snapshot",
+        fieldtype="Long Text",
+        properties={"hidden": 1},
+    )
 
     if client.exists("DocType", "Kitchen Print Queue"):
         print("[OK] Kitchen Print Queue already exists")
