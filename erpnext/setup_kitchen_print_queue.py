@@ -1,10 +1,19 @@
 from __future__ import annotations
 
+import argparse
 import json
-import sys
+from pathlib import Path
 from urllib.parse import quote
 
 import requests
+
+
+KITCHEN_GROUP_TO_COUNTER = {
+    "Bar": "Bar",
+    "Barbecue": "Barbecue",
+    "Kitchen": "Kitchen",
+}
+SERVER_SCRIPT_NAME = "Kitchen Print Queue - Sales Order After Insert"
 
 
 def _system_manager_permissions() -> list[dict]:
@@ -156,6 +165,17 @@ def build_queue_doctype_payload(module: str = "Selling") -> dict:
     }
 
 
+def build_server_script_payload(script: str) -> dict:
+    return {
+        "name": SERVER_SCRIPT_NAME,
+        "script_type": "DocType Event",
+        "reference_doctype": "Sales Order",
+        "doctype_event": "After Insert",
+        "disabled": 0,
+        "script": script,
+    }
+
+
 class SetupClient:
     def __init__(self, base_url: str, api_key: str, api_secret: str, session=None):
         self.base_url = base_url.rstrip("/")
@@ -179,11 +199,52 @@ class SetupClient:
         self._raise(response)
         return True
 
+    def get(self, doctype: str, name: str) -> dict:
+        response = self.session.get(self._url(doctype, name), headers=self.headers, timeout=30)
+        self._raise(response)
+        data = response.json()
+        return data.get("data", data)
+
+    def list_records(
+        self,
+        doctype: str,
+        *,
+        fields: list[str],
+        filters: list | None = None,
+        limit: int = 5000,
+    ) -> list[dict]:
+        params = {
+            "fields": json.dumps(fields),
+            "limit_page_length": int(limit),
+        }
+        if filters:
+            params["filters"] = json.dumps(filters)
+        response = self.session.get(
+            self._url(doctype),
+            headers=self.headers,
+            params=params,
+            timeout=30,
+        )
+        self._raise(response)
+        data = response.json()
+        return data.get("data", [])
+
     def create(self, doctype: str, payload: dict) -> dict:
         response = self.session.post(
             self._url(doctype),
             headers=self.headers,
             json=payload,
+            timeout=30,
+        )
+        self._raise(response)
+        data = response.json()
+        return data.get("data", data)
+
+    def update(self, doctype: str, name: str, values: dict) -> dict:
+        response = self.session.put(
+            self._url(doctype, name),
+            headers=self.headers,
+            json=values,
             timeout=30,
         )
         self._raise(response)
@@ -198,7 +259,7 @@ class SetupClient:
             )
         if response.status_code == 403:
             raise RuntimeError(
-                "403 Permission denied. Run this with a System Manager API user."
+                "403 Permission denied. The API user needs the required ERPNext role/permission."
             )
         try:
             response.raise_for_status()
@@ -272,14 +333,97 @@ def ensure_setup(client: SetupClient, module: str = "Selling") -> None:
         print("[CREATED] Kitchen Print Queue")
 
 
+def _normalized(value) -> str:
+    return str(value or "").strip()
+
+
+def ensure_kitchen_counters(client: SetupClient, default_printer: str = "") -> None:
+    default_printer = _normalized(default_printer)
+    for counter_name in KITCHEN_GROUP_TO_COUNTER.values():
+        if client.exists("Kitchen Counter", counter_name):
+            existing = client.get("Kitchen Counter", counter_name)
+            current_printer = _normalized(existing.get("custom_printer_name"))
+            if default_printer and current_printer in {"", "0"}:
+                client.update(
+                    "Kitchen Counter",
+                    counter_name,
+                    {"custom_printer_name": default_printer},
+                )
+                print(f"[UPDATED] {counter_name} printer -> {default_printer}")
+            else:
+                print(
+                    f"[OK] Kitchen Counter {counter_name} already exists"
+                    + (f" -> {current_printer}" if current_printer else "")
+                )
+            continue
+
+        payload = {"counter_name": counter_name}
+        if default_printer:
+            payload["custom_printer_name"] = default_printer
+        client.create("Kitchen Counter", payload)
+        print(
+            f"[CREATED] Kitchen Counter {counter_name}"
+            + (f" -> {default_printer}" if default_printer else "")
+        )
+
+
+def sync_item_routing(client: SetupClient) -> int:
+    groups = list(KITCHEN_GROUP_TO_COUNTER)
+    items = client.list_records(
+        "Item",
+        fields=["name", "item_group", "custom_kitchen_counter"],
+        filters=[["Item", "item_group", "in", groups]],
+        limit=5000,
+    )
+    changed = 0
+    for item in items:
+        current = _normalized(item.get("custom_kitchen_counter"))
+        if current not in {"", "0"}:
+            continue
+        counter = KITCHEN_GROUP_TO_COUNTER.get(item.get("item_group"))
+        if not counter:
+            continue
+        client.update("Item", item["name"], {"custom_kitchen_counter": counter})
+        changed += 1
+    print(f"[ITEM ROUTING] Updated {changed} item(s).")
+    return changed
+
+
+def ensure_server_script(client: SetupClient, script: str) -> None:
+    payload = build_server_script_payload(script)
+    if client.exists("Server Script", SERVER_SCRIPT_NAME):
+        values = {key: value for key, value in payload.items() if key != "name"}
+        client.update("Server Script", SERVER_SCRIPT_NAME, values)
+        print(f"[UPDATED] Server Script {SERVER_SCRIPT_NAME}")
+        return
+    client.create("Server Script", payload)
+    print(f"[CREATED] Server Script {SERVER_SCRIPT_NAME}")
+
+
+def load_server_script() -> str:
+    path = Path(__file__).resolve().with_name("kitchen_print_queue_server_script.py")
+    return path.read_text(encoding="utf-8-sig")
+
+
 def load_config(path: str = "config.json") -> dict:
     with open(path, "r", encoding="utf-8-sig") as fh:
         return json.load(fh)
 
 
-def main() -> int:
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "config.json"
-    cfg = load_config(config_path)
+def parse_args(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="Set up ERPNext kitchen print queue.")
+    parser.add_argument("config_path", nargs="?", default="config.json")
+    parser.add_argument(
+        "--printer",
+        default=None,
+        help="Initial printer for blank Kitchen Counters. Users can change it later in ERPNext.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    cfg = load_config(args.config_path)
     required = ["FRAPPE_BASE_URL", "API_KEY", "API_SECRET"]
     missing = [key for key in required if not str(cfg.get(key) or "").strip()]
     if missing:
@@ -292,9 +436,19 @@ def main() -> int:
         cfg["API_SECRET"],
     )
     module = str(cfg.get("KITCHEN_QUEUE_MODULE") or "Selling")
+    default_printer = (
+        args.printer
+        if args.printer is not None
+        else str(cfg.get("DEFAULT_KITCHEN_PRINTER") or "")
+    )
+
     print(f"Site: {cfg['FRAPPE_BASE_URL']}")
     ensure_setup(client, module)
+    ensure_kitchen_counters(client, default_printer=default_printer)
+    sync_item_routing(client)
+    ensure_server_script(client, load_server_script())
     print("ERPNext kitchen queue setup complete.")
+    print("Printer assignments remain editable in Kitchen Counter > Printer Name.")
     return 0
 
 
