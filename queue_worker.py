@@ -69,79 +69,249 @@ def _resolve_pdf_renderer(config: dict):
     raise ValueError('Missing PDF renderer: set EDGE_PATH or WKHTMLTOPDF')
 
 
-def discover_sales_orders(client: FrappeQueueClient) -> int:
-    """Create durable queue rows for new Draft Sales Orders using only standard REST APIs."""
+def _route_sales_order_items(client: FrappeQueueClient, sales_order: dict) -> list[dict]:
+    """Return normalized kitchen snapshot rows, including currently unrouted items."""
+    snapshot_items: list[dict] = []
+    item_cache: dict[str, dict] = {}
+    missing_items: list[str] = []
+
+    for row in sales_order.get('items') or []:
+        item_code = str(row.get('item_code') or '')
+        counter = _normalized(row.get('custom_kitchen_counter'))
+
+        if counter in {'', '0'} and item_code:
+            if item_code not in item_cache:
+                item_cache[item_code] = client.get_item(item_code)
+            item = item_cache[item_code]
+            counter = _normalized(item.get('custom_kitchen_counter'))
+            if counter in {'', '0'}:
+                item_group = _normalized(item.get('item_group'))
+                if item_group in DEFAULT_GROUP_COUNTERS:
+                    counter = item_group
+
+        if counter in {'', '0'}:
+            counter = ''
+            missing_items.append(item_code)
+
+        try:
+            qty = float(row.get('qty') or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+
+        snapshot_items.append(
+            {
+                'counter': counter,
+                'item_code': item_code,
+                'item_name': row.get('item_name') or item_code,
+                'qty': qty,
+                'uom': row.get('uom') or row.get('stock_uom') or '',
+                'note': row.get('custom_kitchen_note') or '',
+            }
+        )
+
+    if missing_items:
+        log.warning(
+            'Sales Order %s has item(s) without kitchen routing: %s',
+            sales_order.get('name'),
+            ', '.join(code for code in missing_items if code),
+        )
+
+    return snapshot_items
+
+
+def _snapshot_json(items: list[dict]) -> str:
+    return json.dumps(
+        {'version': 1, 'items': items},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(',', ':'),
+    )
+
+
+def _parse_snapshot(value: str) -> list[dict] | None:
+    text = _normalized(value)
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get('version') != 1:
+        return None
+    items = payload.get('items')
+    if not isinstance(items, list):
+        return None
+    return items
+
+
+def _item_identity(item: dict) -> tuple[str, str, str, str]:
+    return (
+        _normalized(item.get('counter')),
+        _normalized(item.get('item_code')),
+        _normalized(item.get('uom')),
+        _normalized(item.get('note')),
+    )
+
+
+def _aggregate_quantities(items: list[dict]) -> dict[tuple[str, str, str, str], float]:
+    totals: dict[tuple[str, str, str, str], float] = {}
+    for item in items:
+        key = _item_identity(item)
+        try:
+            qty = float(item.get('qty') or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        totals[key] = totals.get(key, 0.0) + qty
+    return totals
+
+
+def _positive_delta_items(previous: list[dict], current: list[dict]) -> list[dict]:
+    """Return only positive quantity increases, grouped by counter/item/uom/note."""
+    previous_qty = _aggregate_quantities(previous)
+    current_qty = _aggregate_quantities(current)
+    representative: dict[tuple[str, str, str, str], dict] = {}
+    for item in current:
+        representative[_item_identity(item)] = item
+
+    delta_items: list[dict] = []
+    for key, qty in current_qty.items():
+        counter = key[0]
+        if not counter:
+            continue
+        increase = qty - previous_qty.get(key, 0.0)
+        if increase <= 0:
+            continue
+        source = representative[key]
+        delta_items.append(
+            {
+                'counter': counter,
+                'item_code': source.get('item_code'),
+                'item_name': source.get('item_name') or source.get('item_code'),
+                'qty': float(increase),
+                'uom': source.get('uom') or '',
+                'note': source.get('note') or '',
+            }
+        )
+    return delta_items
+
+
+def _group_print_items(items: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = {}
+    for item in items:
+        counter = _normalized(item.get('counter'))
+        if not counter:
+            continue
+        grouped.setdefault(counter, []).append(
+            {
+                'item_code': item.get('item_code'),
+                'item_name': item.get('item_name') or item.get('item_code'),
+                'qty': item.get('qty'),
+                'uom': item.get('uom') or '',
+                'note': item.get('note') or '',
+            }
+        )
+    return grouped
+
+
+def _queue_version_token(sales_order: dict) -> str:
+    modified = _normalized(sales_order.get('modified'))
+    return modified or datetime.now().strftime('%Y%m%d%H%M%S%f')
+
+
+def _create_counter_queues(
+    client: FrappeQueueClient,
+    sales_order: dict,
+    counter_items: dict[str, list[dict]],
+    *,
+    delta: bool,
+) -> int:
     created = 0
-    for summary in client.list_unqueued_sales_orders():
+    version_token = _queue_version_token(sales_order)
+
+    for counter, items in counter_items.items():
+        queue_key = (
+            f"{sales_order['name']}|{counter}|{version_token}"
+            if delta
+            else f"{sales_order['name']}|{counter}"
+        )
+        if client.queue_exists(queue_key):
+            continue
+
+        counter_doc = client.get_kitchen_counter(counter)
+        printer_name = _normalized(counter_doc.get('custom_printer_name'))
+        status = 'Pending' if printer_name else 'Error'
+        last_error = (
+            ''
+            if printer_name
+            else f'Printer not configured for Kitchen Counter {counter}'
+        )
+        client.create_queue(
+            {
+                'sales_order': sales_order['name'],
+                'kitchen_counter': counter,
+                'printer_name': printer_name,
+                'items_json': json.dumps(items, ensure_ascii=False),
+                'print_format': 'Kitchen Ticket',
+                'status': status,
+                'retry_count': 0,
+                'last_error': last_error,
+                'queue_key': queue_key,
+            }
+        )
+        created += 1
+        log.info(
+            'Queued %s -> %s -> %s%s',
+            sales_order['name'],
+            counter,
+            printer_name,
+            ' (delta)' if delta else '',
+        )
+
+    return created
+
+
+def discover_sales_orders(client: FrappeQueueClient) -> int:
+    """Queue full first prints and positive deltas for edited Draft Sales Orders."""
+    created = 0
+
+    for summary in client.list_draft_sales_orders():
         sales_order = client.get_sales_order(summary['name'])
-        counter_items: dict[str, list[dict]] = {}
-        item_cache: dict[str, dict] = {}
-        missing_items: list[str] = []
+        current_items = _route_sales_order_items(client, sales_order)
+        current_snapshot = _snapshot_json(current_items)
+        marker = int(sales_order.get('custom_kitchen_queue_created') or 0)
+        previous_items = _parse_snapshot(sales_order.get('custom_kitchen_print_snapshot') or '')
 
-        for row in sales_order.get('items') or []:
-            counter = _normalized(row.get('custom_kitchen_counter'))
-            if counter in {'', '0'}:
-                item_code = str(row.get('item_code') or '')
-                if item_code not in item_cache:
-                    item_cache[item_code] = client.get_item(item_code)
-                item = item_cache[item_code]
-                counter = _normalized(item.get('custom_kitchen_counter'))
-                if counter in {'', '0'}:
-                    item_group = _normalized(item.get('item_group'))
-                    if item_group in DEFAULT_GROUP_COUNTERS:
-                        counter = item_group
+        if marker == 0:
+            created += _create_counter_queues(
+                client,
+                sales_order,
+                _group_print_items(current_items),
+                delta=False,
+            )
+            client.update_sales_order_kitchen_state(sales_order['name'], current_snapshot)
+            continue
 
-            if counter in {'', '0'}:
-                missing_items.append(str(row.get('item_code') or ''))
-                continue
+        if previous_items is None:
+            # Existing orders printed before delta tracking was deployed are baselined once.
+            client.update_sales_order_kitchen_state(sales_order['name'], current_snapshot)
+            log.info('Baselined kitchen snapshot for %s', sales_order['name'])
+            continue
 
-            counter_items.setdefault(counter, []).append(
-                {
-                    'item_code': row.get('item_code'),
-                    'item_name': row.get('item_name') or row.get('item_code'),
-                    'qty': row.get('qty'),
-                    'uom': row.get('uom') or row.get('stock_uom'),
-                    'note': row.get('custom_kitchen_note') or '',
-                }
+        previous_snapshot = _snapshot_json(previous_items)
+        if previous_snapshot == current_snapshot:
+            continue
+
+        delta_items = _positive_delta_items(previous_items, current_items)
+        if delta_items:
+            created += _create_counter_queues(
+                client,
+                sales_order,
+                _group_print_items(delta_items),
+                delta=True,
             )
 
-        if missing_items:
-            log.warning(
-                'Sales Order %s has item(s) without kitchen routing: %s',
-                sales_order.get('name'),
-                ', '.join(missing_items),
-            )
-
-        for counter, items in counter_items.items():
-            queue_key = f"{sales_order['name']}|{counter}"
-            if client.queue_exists(queue_key):
-                continue
-
-            counter_doc = client.get_kitchen_counter(counter)
-            printer_name = _normalized(counter_doc.get('custom_printer_name'))
-            status = 'Pending' if printer_name else 'Error'
-            last_error = (
-                ''
-                if printer_name
-                else f'Printer not configured for Kitchen Counter {counter}'
-            )
-            client.create_queue(
-                {
-                    'sales_order': sales_order['name'],
-                    'kitchen_counter': counter,
-                    'printer_name': printer_name,
-                    'items_json': json.dumps(items, ensure_ascii=False),
-                    'print_format': 'Kitchen Ticket',
-                    'status': status,
-                    'retry_count': 0,
-                    'last_error': last_error,
-                    'queue_key': queue_key,
-                }
-            )
-            created += 1
-            log.info('Queued %s -> %s -> %s', sales_order['name'], counter, printer_name)
-
-        client.mark_sales_order_queued(sales_order['name'])
+        # Decreases/removals intentionally do not print, but still become the new baseline.
+        client.update_sales_order_kitchen_state(sales_order['name'], current_snapshot)
 
     return created
 
