@@ -60,14 +60,13 @@ def test_build_ticket_html_uses_compact_waiter_layout():
     assert 'Order:' not in html
     assert 'Table/Customer:' not in html
     assert 'Time:' not in html
-    assert (
-        '<div class="ticket-head"><span class="table-name">Table 08</span>'
-        '<span class="order-datetime">08/09/2026 12:09:27</span></div>'
-        in html
-    )
-    assert '.ticket-head { display: flex;' in html
+    assert '<table class="ticket-head">' in html
+    assert '<td class="table-name">Table 08</td>' in html
+    assert '<td class="order-datetime">08/09/2026 12:09:27</td>' in html
+    assert 'display: flex' not in html
+    assert '.ticket-head { width: 100%; border-collapse: collapse;' in html
     assert '.table-name { font-size: 13px; font-weight: 700;' in html
-    assert '.order-datetime { font-size: 12px; white-space: nowrap;' in html
+    assert '.order-datetime { font-size: 12px; text-align: right; white-space: nowrap;' in html
     assert 'K00037' not in html
     assert '3.0' not in html
     assert '<span class="qty">3 Nos x</span>' in html
