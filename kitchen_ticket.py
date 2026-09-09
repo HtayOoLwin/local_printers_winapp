@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import html as html_module
 import os
 import shutil
@@ -22,6 +23,18 @@ def _format_qty(value) -> str:
         return str(value or '')
 
 
+def _format_order_datetime(value) -> str:
+    text = str(value or '').strip()
+    if not text:
+        return ''
+
+    try:
+        parsed = datetime.fromisoformat(text.replace('Z', '+00:00'))
+        return parsed.strftime('%d/%m/%Y %H:%M:%S')
+    except ValueError:
+        return text
+
+
 def build_ticket_html(queue: dict, sales_order: dict, items: list[dict], restaurant_name: str) -> str:
     item_rows = []
     for item in items:
@@ -39,6 +52,9 @@ def build_ticket_html(queue: dict, sales_order: dict, items: list[dict], restaur
         )
 
     order_time = sales_order.get('creation') or sales_order.get('transaction_date') or ''
+    formatted_order_time = _format_order_datetime(order_time)
+    table_name = _esc(sales_order.get('customer'))
+
     return f'''<!doctype html>
 <html>
 <head>
@@ -47,7 +63,9 @@ def build_ticket_html(queue: dict, sales_order: dict, items: list[dict], restaur
 @page {{ size: 80mm auto; margin: 0 2mm 1mm 2mm; }}
 body {{ font-family: Arial, sans-serif; font-size: 12px; margin: 0; padding: 0; }}
 .rule {{ border-top: 1px dashed #000; margin: 2px 0; }}
-.info {{ margin: 1px 0; }}
+.ticket-head {{ display: flex; justify-content: space-between; align-items: baseline; gap: 6px; margin: 1px 0; }}
+.table-name {{ font-size: 13px; font-weight: 700; }}
+.order-datetime {{ font-size: 12px; white-space: nowrap; }}
 .item {{ margin: 3px 0; }}
 .item-line {{ font-size: 12px; font-weight: 700; }}
 .qty {{ display: inline-block; }}
@@ -56,9 +74,7 @@ body {{ font-family: Arial, sans-serif; font-size: 12px; margin: 0; padding: 0; 
 </head>
 <body>
 <div class="rule"></div>
-<div class="info"><b>Order:</b> {_esc(queue.get('sales_order'))}</div>
-<div class="info"><b>Table/Customer:</b> {_esc(sales_order.get('customer'))}</div>
-<div class="info"><b>Time:</b> {_esc(order_time)}</div>
+<div class="ticket-head"><span class="table-name">{table_name}</span><span class="order-datetime">{_esc(formatted_order_time)}</span></div>
 <div class="rule"></div>
 {''.join(item_rows)}
 <div class="rule"></div>
