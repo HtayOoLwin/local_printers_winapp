@@ -56,6 +56,18 @@ def test_build_ticket_html_uses_compact_waiter_layout():
 
     assert 'Doh Myot Daw BBQ &amp; Restaurant' not in html
     assert '<div class="center counter">Kitchen</div>' not in html
+    assert 'SAL-ORD-2026-00011' not in html
+    assert 'Order:' not in html
+    assert 'Table/Customer:' not in html
+    assert 'Time:' not in html
+    assert (
+        '<div class="ticket-head"><span class="table-name">Table 08</span>'
+        '<span class="order-datetime">08/09/2026 12:09:27</span></div>'
+        in html
+    )
+    assert '.ticket-head { display: flex;' in html
+    assert '.table-name { font-size: 13px; font-weight: 700;' in html
+    assert '.order-datetime { font-size: 12px; white-space: nowrap;' in html
     assert 'K00037' not in html
     assert '3.0' not in html
     assert '<span class="qty">3 Nos x</span>' in html
