@@ -63,9 +63,10 @@ def build_ticket_html(queue: dict, sales_order: dict, items: list[dict], restaur
 @page {{ size: 80mm auto; margin: 0 2mm 1mm 2mm; }}
 body {{ font-family: Arial, sans-serif; font-size: 12px; margin: 0; padding: 0; }}
 .rule {{ border-top: 1px dashed #000; margin: 2px 0; }}
-.ticket-head {{ display: flex; justify-content: space-between; align-items: baseline; gap: 6px; margin: 1px 0; }}
+.ticket-head {{ width: 100%; border-collapse: collapse; margin: 1px 0; }}
+.ticket-head td {{ padding: 0; vertical-align: baseline; }}
 .table-name {{ font-size: 13px; font-weight: 700; }}
-.order-datetime {{ font-size: 12px; white-space: nowrap; }}
+.order-datetime {{ font-size: 12px; text-align: right; white-space: nowrap; }}
 .item {{ margin: 3px 0; }}
 .item-line {{ font-size: 12px; font-weight: 700; }}
 .qty {{ display: inline-block; }}
@@ -74,7 +75,7 @@ body {{ font-family: Arial, sans-serif; font-size: 12px; margin: 0; padding: 0; 
 </head>
 <body>
 <div class="rule"></div>
-<div class="ticket-head"><span class="table-name">{table_name}</span><span class="order-datetime">{_esc(formatted_order_time)}</span></div>
+<table class="ticket-head"><tr><td class="table-name">{table_name}</td><td class="order-datetime">{_esc(formatted_order_time)}</td></tr></table>
 <div class="rule"></div>
 {''.join(item_rows)}
 <div class="rule"></div>
