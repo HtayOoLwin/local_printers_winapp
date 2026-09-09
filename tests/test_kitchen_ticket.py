@@ -36,6 +36,37 @@ def test_build_ticket_html_escapes_user_content_and_has_no_prices():
     assert 'Grand Total' not in html
 
 
+def test_build_ticket_html_uses_compact_waiter_layout():
+    queue = {
+        'kitchen_counter': 'Kitchen',
+        'sales_order': 'SAL-ORD-2026-00011',
+    }
+    sales_order = {
+        'customer': 'Table 08',
+        'creation': '2026-09-08 12:09:27.778956',
+    }
+    items = [{
+        'item_code': 'K00037',
+        'item_name': 'S.F Chicken',
+        'qty': 3.0,
+        'uom': 'Nos',
+        'note': 'Less spicy',
+    }]
+
+    html = build_ticket_html(queue, sales_order, items, 'Doh Myot Daw BBQ & Restaurant')
+
+    assert 'Doh Myot Daw BBQ &amp; Restaurant' not in html
+    assert '<div class="center counter">Kitchen</div>' not in html
+    assert 'K00037' not in html
+    assert '3.0' not in html
+    assert '<span class="qty">3 Nos x</span>' in html
+    assert '<span class="name">S.F Chicken</span>' in html
+    assert 'Remark: Less spicy' in html
+    assert '.item-line { font-size: 12px;' in html
+    assert '.note { font-size: 12px;' in html
+    assert '@page { size: 80mm auto; margin: 0 2mm 1mm 2mm; }' in html
+
+
 def test_edge_renderer_waits_for_pdf_created_after_browser_process_returns(tmp_path, monkeypatch):
     edge = tmp_path / 'msedge.exe'
     edge.write_text('edge')
