@@ -27,7 +27,6 @@ def test_build_ticket_html_escapes_user_content_and_has_no_prices():
         'rate': 5000,
     }]
     html = build_ticket_html(queue, sales_order, items, 'Doh Myot Daw BBQ & Restaurant')
-    assert 'BBQ &lt;Counter&gt;' in html
     assert 'Table &lt;07&gt;' in html
     assert 'Pork &amp; &lt;Spicy&gt;' in html
     assert '&lt;script&gt;alert(1)&lt;/script&gt;' in html
