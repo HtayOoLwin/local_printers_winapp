@@ -5,7 +5,7 @@ Windows middleware for silent printing from ERPNext/Frappe.
 This repository supports three compatible printing paths:
 
 1. **Kitchen Print Queue mode (recommended for kitchen tickets)** — no `local_printers` Frappe app required. `queue_worker.py` polls the custom ERPNext `Kitchen Print Queue` DocType and prints counter-specific tickets.
-2. **Cashier BCN Print Job polling** — no `local_printers` Frappe app required. `socket_app.py` token-polls OurCity for server-rendered cashier bill PDFs and reports Printed/Failed results.
+2. **Cashier BCN Print Job polling** — no `local_printers` Frappe app required. `socket_app.py` token-polls OurCity for cashier bill jobs in legacy PDF mode or HTML mode; HTML jobs are rendered locally with Microsoft Edge before SumatraPDF prints them, then Printed/Failed is reported.
 3. **Legacy Socket.IO mode** — `socket_app.py` still supports the existing `document_print_event` and `sales_invoice_submitted` listeners when the legacy Socket.IO/login configuration is present.
 
 ## Kitchen Print Queue Mode
@@ -37,14 +37,15 @@ The paste-ready Sales Order Server Script is:
 
 Target site: `https://ourcity.s.frappe.cloud`
 
-Cashier billing uses the durable `BCN Print Job` queue created on OurCity. The Windows client sends the locally installed printer names to `bcn_print_jobs`, claims at most one matching Pending job, prints the supplied `pdf_base64` once through SumatraPDF, then reports the terminal result to `bcn_print_job_result`.
+Cashier billing uses the durable `BCN Print Job` queue created on OurCity. The Windows client sends locally installed printer names to `bcn_print_jobs` and claims at most one matching Pending job. A job with missing `render_mode` or `render_mode = PDF` uses the legacy `pdf_base64 -> SumatraPDF` path. A job with `render_mode = HTML` requires `html_content`; Microsoft Edge renders that UTF-8 HTML locally to PDF, then the existing SumatraPDF path prints it. The terminal result is reported to `bcn_print_job_result`.
 
 ```text
 Waiter Request for Bill
-  -> Draft Sales Invoice PDF snapshot
-  -> BCN Print Job / Pending
+  -> Draft Sales Invoice HTML snapshot
+  -> BCN Print Job / Pending (render_mode = HTML, html_content = snapshot)
   -> socket_app.py
   -> bcn_print_jobs / Processing
+  -> Microsoft Edge / local PDF
   -> SumatraPDF / Windows printer
   -> bcn_print_job_result / Printed or Failed
 ```
@@ -58,6 +59,8 @@ Run cashier polling with:
 ```
 
 If `LOGIN_URL`, `AUTH_DATA`, and `FRAPPE_SOCKET_URL` are not configured, `socket_app.py` stays alive in **cashier polling only** mode. If those legacy settings are present, the same process also keeps the original Socket.IO listeners.
+
+HTML cashier jobs require `EDGE_PATH` to point to Microsoft Edge. HTML mode does not fall back to server wkhtmltopdf if Edge rendering fails; the job is reported as Failed instead. Legacy PDF jobs remain supported for backward compatibility.
 
 Cashier polling defaults to 2 seconds. A claimed job is physically printed once by the process. If the Printed/Failed result POST cannot be acknowledged, the client retries only the result and does not claim another job or physically print the same job again.
 
@@ -119,7 +122,7 @@ To run kitchen and cashier printing on the same PC, keep `queue_worker.py` and `
 - Windows
 - Python 3.10+
 - dependencies from `requirements.txt`
-- Microsoft Edge for the current kitchen PDF renderer
+- Microsoft Edge for the kitchen renderer and cashier HTML-mode renderer
 - SumatraPDF
 - Windows printers installed and visible through `Get-Printer`
 
@@ -145,6 +148,7 @@ Legacy Socket.IO additionally needs its original `LOGIN_URL`, `AUTH_DATA`, `FRAP
 | Cashier job becomes Failed after timeout | Check whether paper printed before deciding to use manual Reprint |
 | Kitchen queue stays Pending | `queue_worker.py` is not running or cannot read the kitchen queue |
 | Queue reports printer not installed | `printer_name` must exactly match `Get-Printer` output |
+| HTML cashier rendering failure | Verify `EDGE_PATH`; HTML mode does not fall back to wkhtmltopdf |
 | PDF rendering failure | Verify the configured renderer path |
 | SumatraPDF failure | Verify `SUMATRA_PDF_PATH` and printer status |
 | No kitchen queue row after mobile order | Check Sales Order Server Script and item Kitchen Counter mapping |
