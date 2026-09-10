@@ -137,7 +137,9 @@ def test_print_single_job_html_mode_renders_edge_then_prints(monkeypatch, tmp_pa
     monkeypatch.setattr(
         printer_handlers,
         "render_html_to_pdf_edge",
-        lambda html, edge: calls.append(("render", html, edge)) or str(rendered),
+        lambda html, edge, **kwargs: calls.append(
+            ("render", html, edge, kwargs)
+        ) or str(rendered),
     )
     monkeypatch.setattr(
         printer_handlers,
@@ -165,6 +167,9 @@ def test_print_single_job_html_mode_renders_edge_then_prints(monkeypatch, tmp_pa
             "render",
             "<html><body>မြန်မာ</body></html>",
             r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            {
+                "printable_width_mm": 72.0,
+            },
         ),
         (
             "print",
@@ -211,3 +216,128 @@ def test_print_single_job_rejects_unknown_render_mode():
             },
             {},
         )
+
+
+def test_print_single_job_html_mode_passes_configured_thermal_width(
+    monkeypatch,
+    tmp_path,
+):
+    rendered = tmp_path / "cashier.pdf"
+    rendered.write_bytes(b"%PDF-edge")
+
+    calls = []
+
+    def fake_render(
+        html,
+        edge,
+        **kwargs,
+    ):
+        calls.append(
+            (
+                html,
+                edge,
+                kwargs,
+            )
+        )
+        return str(rendered)
+
+    monkeypatch.setattr(
+        printer_handlers,
+        "render_html_to_pdf_edge",
+        fake_render,
+    )
+
+    monkeypatch.setattr(
+        printer_handlers,
+        "print_pdf_silent",
+        lambda *args, **kwargs: None,
+    )
+
+    result = printer_handlers.print_single_job(
+        {
+            "render_mode": "HTML",
+            "html_content": (
+                "<html><body>bill</body></html>"
+            ),
+            "printer_name": "Kitchen Printer",
+        },
+        {
+            "EDGE_PATH": "msedge.exe",
+            "SUMATRA_PDF_PATH": "SumatraPDF.exe",
+            "CASHIER_PRINTABLE_WIDTH_MM": 72.0,
+        },
+    )
+
+    assert result == "Kitchen Printer"
+
+    assert calls == [
+        (
+            "<html><body>bill</body></html>",
+            "msedge.exe",
+            {
+                "printable_width_mm": 72.0,
+            },
+        )
+    ]
+
+
+def test_print_single_job_html_mode_defaults_to_72mm(
+    monkeypatch,
+    tmp_path,
+):
+    rendered = tmp_path / "cashier.pdf"
+    rendered.write_bytes(b"%PDF-edge")
+
+    calls = []
+
+    def fake_render(
+        html,
+        edge,
+        **kwargs,
+    ):
+        calls.append(
+            (
+                html,
+                edge,
+                kwargs,
+            )
+        )
+        return str(rendered)
+
+    monkeypatch.setattr(
+        printer_handlers,
+        "render_html_to_pdf_edge",
+        fake_render,
+    )
+
+    monkeypatch.setattr(
+        printer_handlers,
+        "print_pdf_silent",
+        lambda *args, **kwargs: None,
+    )
+
+    result = printer_handlers.print_single_job(
+        {
+            "render_mode": "HTML",
+            "html_content": (
+                "<html><body>bill</body></html>"
+            ),
+            "printer_name": "Kitchen Printer",
+        },
+        {
+            "EDGE_PATH": "msedge.exe",
+            "SUMATRA_PDF_PATH": "SumatraPDF.exe",
+        },
+    )
+
+    assert result == "Kitchen Printer"
+
+    assert calls == [
+        (
+            "<html><body>bill</body></html>",
+            "msedge.exe",
+            {
+                "printable_width_mm": 72.0,
+            },
+        )
+    ]

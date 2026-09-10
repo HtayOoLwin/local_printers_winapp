@@ -104,7 +104,18 @@ def print_single_job(job: dict, config_data: dict) -> str:
         if not edge_path:
             raise ValueError("EDGE_PATH is required for HTML cashier printing")
 
-        pdf_path = render_html_to_pdf_edge(html_content, edge_path)
+        printable_width_mm = config_data.get(
+            "CASHIER_PRINTABLE_WIDTH_MM",
+            72.0,
+        )
+
+        pdf_path = render_html_to_pdf_edge(
+            html_content,
+            edge_path,
+            printable_width_mm=float(
+                printable_width_mm
+            ),
+        )
     elif render_mode == "PDF":
         pdf_base64 = job.get("pdf_base64")
         if not pdf_base64:
