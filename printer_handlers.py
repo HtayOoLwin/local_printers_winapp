@@ -12,6 +12,8 @@ from logging.handlers import RotatingFileHandler
 
 import win32print
 
+from cashier_html import render_html_to_pdf_edge
+
 # ---------------------------------------------------------------------------
 # Logging – file + console
 # ---------------------------------------------------------------------------
@@ -86,18 +88,33 @@ def save_pdf_from_base64(pdf_base64: str) -> str | None:
 
 
 def print_single_job(job: dict, config_data: dict) -> str:
-    """Print one queue job and raise when decode or physical printing fails."""
-    pdf_base64 = job.get("pdf_base64")
+    """Print one queue job and raise when render/decode or physical printing fails."""
+    render_mode = str(job.get("render_mode") or "PDF").strip().upper()
     printer_name = job.get("printer_name") or job.get("printer")
 
-    if not pdf_base64:
-        raise ValueError("Print job has no pdf_base64")
     if not printer_name:
         raise ValueError("Print job has no printer name")
 
-    pdf_path = save_pdf_from_base64(pdf_base64)
-    if not pdf_path:
-        raise ValueError("Failed to decode/save print job PDF")
+    if render_mode == "HTML":
+        html_content = str(job.get("html_content") or "")
+        if not html_content.strip():
+            raise ValueError("HTML print job has no html_content")
+
+        edge_path = str(config_data.get("EDGE_PATH") or "").strip()
+        if not edge_path:
+            raise ValueError("EDGE_PATH is required for HTML cashier printing")
+
+        pdf_path = render_html_to_pdf_edge(html_content, edge_path)
+    elif render_mode == "PDF":
+        pdf_base64 = job.get("pdf_base64")
+        if not pdf_base64:
+            raise ValueError("Print job has no pdf_base64")
+
+        pdf_path = save_pdf_from_base64(pdf_base64)
+        if not pdf_path:
+            raise ValueError("Failed to decode/save print job PDF")
+    else:
+        raise ValueError("Unsupported print render_mode: " + render_mode)
 
     sumatra_pdf_path = config_data.get(
         "SUMATRA_PDF_PATH", r"C:\Program Files\SumatraPDF\SumatraPDF.exe"
