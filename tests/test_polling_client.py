@@ -55,6 +55,15 @@ def test_report_result_posts_exact_contract():
     session.post.return_value = response
     result = polling_client.report_result(session, _cfg(), "BCN-PRINT-JOB-00001", "Printed")
     assert result["status"] == "Printed"
+    session.post.assert_called_once_with(
+        "https://ourcity.s.frappe.cloud/api/method/bcn_print_job_result",
+        json={
+            "job_name": "BCN-PRINT-JOB-00001",
+            "status": "Printed",
+        },
+        headers={"Authorization": "token key:secret"},
+        timeout=30,
+    )
 
 
 def test_report_failed_result_includes_error_message():
